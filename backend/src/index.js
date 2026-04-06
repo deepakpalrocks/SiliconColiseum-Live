@@ -4,6 +4,7 @@ import cors from "cors";
 import cron from "node-cron";
 import { initDb } from "./db/database.js";
 import { initWallet, getWalletAddress } from "./services/wallet.js";
+import { initGroqPool, getPoolSize } from "./services/groqPool.js";
 import authRouter from "./routes/auth.js";
 import agentsRouter from "./routes/agents.js";
 import tradesRouter from "./routes/trades.js";
@@ -23,6 +24,9 @@ app.use(express.json());
 await initDb();
 console.log("Database initialized");
 
+// Initialize Groq API key pool
+initGroqPool();
+
 // Initialize shared trading wallet
 const wallet = initWallet();
 if (wallet) {
@@ -39,11 +43,20 @@ app.use("/api/trades", tradesRouter);
 app.use("/api/leaderboard", leaderboardRouter);
 app.use("/api/wallet", walletRouter);
 
-// Manual trigger for testing
+// Evaluate endpoint - works as both manual trigger AND external cron target
+// Use GET so external cron services (cron-job.org) can hit it easily
 app.post("/api/evaluate", async (_req, res) => {
   try {
     await evaluateAllAgents();
     res.json({ success: true, message: "Evaluation triggered" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get("/api/evaluate", async (_req, res) => {
+  try {
+    await evaluateAllAgents();
+    res.json({ success: true, message: "Evaluation triggered via GET" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -60,18 +73,22 @@ app.get("/api/health", async (_req, res) => {
   });
 });
 
-// Schedule cron job
-cron.schedule(`*/${CRON_MINUTES} * * * *`, () => {
-  console.log(`[CRON] Running scheduled evaluation (every ${CRON_MINUTES} min)...`);
-  evaluateAllAgents().catch((err) =>
-    console.error("[CRON] Evaluation failed:", err.message)
-  );
-});
+// Schedule internal cron job (works when server stays alive, e.g. VPS/Railway)
+// For free tiers that sleep (Render), use external cron service hitting GET /api/evaluate
+const USE_INTERNAL_CRON = process.env.USE_INTERNAL_CRON !== "false";
+if (USE_INTERNAL_CRON) {
+  cron.schedule(`*/${CRON_MINUTES} * * * *`, () => {
+    console.log(`[CRON] Running scheduled evaluation (every ${CRON_MINUTES} min)...`);
+    evaluateAllAgents().catch((err) =>
+      console.error("[CRON] Evaluation failed:", err.message)
+    );
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   console.log(`Mode: LIVE TRADING on Arbitrum One`);
-  console.log(`Cron job scheduled every ${CRON_MINUTES} minutes`);
+  console.log(`Internal cron: ${USE_INTERNAL_CRON ? `every ${CRON_MINUTES} min` : "DISABLED (use external cron)"}`);
   console.log(`GROQ_API_KEY: ${process.env.GROQ_API_KEY ? "set" : "NOT SET"}`);
   console.log(`WALLET_PRIVATE_KEY: ${process.env.WALLET_PRIVATE_KEY ? "set" : "NOT SET"}`);
 });

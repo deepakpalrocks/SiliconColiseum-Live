@@ -150,8 +150,9 @@ export async function runTradeAgent(
   sentimentData = [],
   personality = ""
 ) {
+  const model = process.env.TRADE_MODEL || "llama-3.3-70b-versatile";
   const response = await client.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
+    model,
     messages: [
       { role: "system", content: systemPrompt(personality) },
       { role: "user", content: buildPrompt(cfg, marketData, sentimentData) },

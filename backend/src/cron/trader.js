@@ -3,14 +3,13 @@
  * and executes REAL trades via Odos Router on Arbitrum One.
  */
 
-import OpenAI from "openai";
 import { queryAll, queryOne, execute } from "../db/database.js";
 import { runTradeAgent } from "../agent/agent.js";
 import { fetchMultipleTokens } from "../services/market.js";
 import { fetchTwitterSentiment } from "../services/sentiment.js";
 import { buyTokenWithUSDT, sellTokenForUSDT } from "../services/odos.js";
-import { getWallet, getTokenBalance } from "../services/wallet.js";
-import { getTokenDecimals } from "../services/tokens.js";
+import { getWallet } from "../services/wallet.js";
+import { getGroqClient, getPoolSize } from "../services/groqPool.js";
 
 // Lock to prevent concurrent evaluations
 let isEvaluating = false;
@@ -30,9 +29,8 @@ export async function evaluateAllAgents() {
 }
 
 async function _evaluateAllAgents() {
-  const groqKey = process.env.GROQ_API_KEY;
-  if (!groqKey) {
-    console.warn("[CRON] No GROQ_API_KEY set, skipping evaluation");
+  if (!getPoolSize()) {
+    console.warn("[CRON] No Groq API keys set, skipping evaluation");
     return;
   }
 
@@ -60,17 +58,15 @@ async function _evaluateAllAgents() {
   console.log(`[CRON] Fetching market data for ${allTokens.size} tokens...`);
   const marketData = await fetchMultipleTokens([...allTokens]);
 
-  console.log("[CRON] Fetching sentiment data...");
-  const sentimentData = await fetchTwitterSentiment(groqKey, [...allTokens]);
-
-  const client = new OpenAI({
-    apiKey: groqKey,
-    baseURL: "https://api.groq.com/openai/v1",
-  });
-
+  // Fetch sentiment per-agent (only their tokens) with rotating keys
   for (const agent of agents) {
     try {
-      await evaluateAgent(client, agent, marketData, sentimentData);
+      const agentTokens = JSON.parse(agent.tokens);
+      console.log(`[CRON] Fetching sentiment for "${agent.name}" (${agentTokens.length} tokens)...`);
+      const sentimentClient = getGroqClient(); // rotates key
+      const sentimentData = await fetchTwitterSentiment(sentimentClient, agentTokens);
+      const tradeClient = getGroqClient(); // rotates to next key
+      await evaluateAgent(tradeClient, agent, marketData, sentimentData);
       // 3-second delay between agents to avoid rate limits and nonce issues
       await new Promise((r) => setTimeout(r, 3000));
     } catch (err) {
@@ -81,7 +77,7 @@ async function _evaluateAllAgents() {
   console.log("[CRON] Evaluation complete");
 }
 
-async function evaluateAgent(client, agent, allMarketData, allSentimentData) {
+async function evaluateAgent(client, agent, allMarketData, sentimentData) {
   const tokens = JSON.parse(agent.tokens);
   const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [agent.id]);
 
@@ -90,7 +86,7 @@ async function evaluateAgent(client, agent, allMarketData, allSentimentData) {
     if (allMarketData.has(t)) agentMarketData.set(t, allMarketData.get(t));
   }
 
-  const agentSentiment = allSentimentData.filter((s) => tokens.includes(s.token));
+  const agentSentiment = sentimentData || [];
 
   const cfg = {
     budget: agent.current_balance,

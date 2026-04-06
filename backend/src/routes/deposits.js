@@ -10,6 +10,20 @@ const USDT_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
 ];
 
+// Retry helper for flaky RPC calls
+async function withRetry(fn, retries = 3, delayMs = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      console.warn(`[RPC] Attempt ${i + 1} failed: ${err.message}, retrying in ${delayMs}ms...`);
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs *= 2; // exponential backoff
+    }
+  }
+}
+
 // GET /api/wallet/info - get shared wallet address and balances
 router.get("/info", async (_req, res) => {
   try {
@@ -84,7 +98,7 @@ router.post("/confirm-deposit", async (req, res) => {
 
   try {
     const provider = getProvider();
-    const receipt = await provider.getTransactionReceipt(tx_hash);
+    const receipt = await withRetry(() => provider.getTransactionReceipt(tx_hash));
 
     if (!receipt) {
       return res.status(404).json({ error: "Transaction not found or not yet confirmed" });
