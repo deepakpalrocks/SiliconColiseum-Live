@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Light mode (default) ── */
+:root {
+  --color-white: 17 24 39;
+  --dark-900: 255 255 255;
+  --dark-800: 249 250 251;
+  --dark-700: 243 244 246;
+  --dark-600: 229 231 235;
+  --dark-500: 209 213 219;
+  --gray-100: 17 24 39;
+  --gray-200: 31 41 55;
+  --gray-300: 55 65 81;
+  --gray-400: 75 85 99;
+  --gray-500: 107 114 128;
+  --gray-600: 156 163 175;
+  --gray-700: 209 213 219;
+}
+
+/* ── Dark mode ── */
+.dark {
+  --color-white: 255 255 255;
+  --dark-900: 10 10 15;
+  --dark-800: 18 18 26;
+  --dark-700: 26 26 38;
+  --dark-600: 36 36 51;
+  --dark-500: 46 46 66;
+  --gray-100: 243 244 246;
+  --gray-200: 229 231 235;
+  --gray-300: 209 213 219;
+  --gray-400: 156 163 175;
+  --gray-500: 107 114 128;
+  --gray-600: 75 85 99;
+  --gray-700: 55 65 81;
+}
+
+body {
+  font-family: "Inter", sans-serif;
+  min-height: 100vh;
+}
+
+code, .font-mono {
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: rgb(var(--dark-800)); }
+::-webkit-scrollbar-thumb { background: rgb(var(--dark-500)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--gray-500)); }
+
+/* Glow effects */
+.glow-green { box-shadow: 0 0 20px rgba(0, 255, 136, 0.15); }
+.glow-red { box-shadow: 0 0 20px rgba(255, 68, 102, 0.15); }
+.glow-blue { box-shadow: 0 0 20px rgba(68, 136, 255, 0.15); }
+
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-pulse-green { animation: pulse-green 2s ease-in-out infinite; }
