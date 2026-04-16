@@ -86,15 +86,17 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     if (allMarketData.has(t)) agentMarketData.set(t, allMarketData.get(t));
   }
 
+  const currentHoldings = holdings.map((h) => ({
+    token: h.token,
+    amount: h.amount,
+    avgBuyPrice: h.avg_buy_price,
+  }));
+
   const cfg = {
     budget: agent.current_balance,
     riskLevel: agent.risk_level,
     selectedTokens: tokens,
-    currentHoldings: holdings.map((h) => ({
-      token: h.token,
-      amount: h.amount,
-      avgBuyPrice: h.avg_buy_price,
-    })),
+    currentHoldings,
   };
 
   console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)})...`);
@@ -155,22 +157,20 @@ async function executeBundledBuys(agent, buyActions, marketData) {
 
   if (!validBuys.length) return;
 
-  // Scale amounts to fit within budget
+  // sanitizeDecision() already enforced budget limits, but do a final safety check
   const totalRequested = validBuys.reduce((sum, a) => sum + (a.amount_usd || 0), 0);
-  let budget = agent.current_balance;
-
-  if (totalRequested > budget) {
-    const scale = budget / totalRequested;
+  if (totalRequested > agent.current_balance) {
+    const scale = agent.current_balance * 0.95 / totalRequested;
     for (const a of validBuys) {
       a.amount_usd = Math.floor(a.amount_usd * scale * 100) / 100;
     }
-    console.log(`[CRON] Scaled ${validBuys.length} BUYs from $${totalRequested.toFixed(2)} to $${budget.toFixed(2)}`);
+    console.log(`[CRON] Safety scaled BUYs from $${totalRequested.toFixed(2)} to fit $${agent.current_balance.toFixed(2)}`);
   }
 
-  // Filter out too-small buys after scaling
-  const buys = validBuys.filter((a) => a.amount_usd >= 0.5);
+  // Filter out buys below $5 minimum
+  const buys = validBuys.filter((a) => a.amount_usd >= 5);
   if (!buys.length) {
-    console.warn(`[CRON] All BUY amounts too small after scaling`);
+    console.warn(`[CRON] All BUY amounts below $5 minimum`);
     return;
   }
 
