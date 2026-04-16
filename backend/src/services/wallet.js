@@ -104,7 +104,7 @@ export async function approveToken(tokenAddress, spender, amount) {
 /**
  * Send a raw transaction (used for Odos assembled swaps)
  */
-// Max gas cost in USD before skipping a trade
+// Max gas cost in USD per transaction
 const MAX_GAS_COST_USD = parseFloat(process.env.MAX_GAS_COST_USD || "0.005");
 
 export async function sendTransaction(txData) {
@@ -129,28 +129,25 @@ export async function sendTransaction(txData) {
     }
   }
 
-  // Check estimated gas cost in USD before sending
+  // Use "Low" gas strategy: base fee + 35% buffer, zero priority fee
   const feeData = await provider.getFeeData();
-  const gasPrice = feeData.gasPrice || 0n;
-  const estimatedCostWei = gasLimit * gasPrice;
-  const estimatedCostEth = parseFloat(ethers.formatEther(estimatedCostWei));
+  const baseFee = feeData.gasPrice || 0n;
+  const maxFeePerGas = baseFee * 135n / 100n; // 35% above current base fee
+  const maxPriorityFeePerGas = 0n;             // no tip, like MetaMask "Low"
 
-  // Fetch ETH price from a simple heuristic (Arbitrum gas is cheap)
-  // Use coingecko-free or fallback to a reasonable estimate
+  const estimatedCostEth = parseFloat(ethers.formatEther(gasLimit * maxFeePerGas));
   const ethPriceUsd = await getEthPriceUsd();
   const estimatedCostUsd = estimatedCostEth * ethPriceUsd;
 
-  console.log(`[WALLET] Gas estimate: ${gasLimit} units, ~$${estimatedCostUsd.toFixed(4)} (limit: $${MAX_GAS_COST_USD})`);
-
-  if (estimatedCostUsd > MAX_GAS_COST_USD) {
-    throw new Error(`Gas too expensive: $${estimatedCostUsd.toFixed(4)} > $${MAX_GAS_COST_USD} limit. Skipping trade.`);
-  }
+  console.log(`[WALLET] Gas: ${gasLimit} units | baseFee: ${ethers.formatUnits(baseFee, "gwei")} gwei | maxFee: ${ethers.formatUnits(maxFeePerGas, "gwei")} gwei | est: $${estimatedCostUsd.toFixed(6)}`);
 
   const tx = await wallet.sendTransaction({
     to: txData.to,
     data: txData.data,
     value: txData.value || 0n,
     gasLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
   });
 
   const receipt = await tx.wait();
