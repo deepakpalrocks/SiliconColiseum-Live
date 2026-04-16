@@ -4,7 +4,7 @@ import cors from "cors";
 import cron from "node-cron";
 import { initDb } from "./db/database.js";
 import { initWallet, getWalletAddress } from "./services/wallet.js";
-import { initGroqPool, getPoolSize } from "./services/groqPool.js";
+import { initGroqPool, getPoolSize, getPoolStatus } from "./services/groqPool.js";
 import authRouter from "./routes/auth.js";
 import agentsRouter from "./routes/agents.js";
 import tradesRouter from "./routes/trades.js";
@@ -15,7 +15,7 @@ import { evaluateAllAgents } from "./cron/trader.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const CRON_MINUTES = parseInt(process.env.CRON_INTERVAL_MINUTES) || 5;
+const CRON_MINUTES = parseInt(process.env.CRON_INTERVAL_MINUTES) || 15;
 
 app.use(cors());
 app.use(express.json());
@@ -24,7 +24,7 @@ app.use(express.json());
 await initDb();
 console.log("Database initialized");
 
-// Initialize Groq API key pool
+// Initialize LLM provider pool (Cerebras primary + Groq fallback)
 initGroqPool();
 
 // Initialize shared trading wallet
@@ -70,6 +70,7 @@ app.get("/api/health", async (_req, res) => {
     wallet: getWalletAddress() || "not configured",
     chain: "Arbitrum One",
     mode: "LIVE TRADING",
+    llmPool: getPoolStatus(),
   });
 });
 
@@ -89,6 +90,6 @@ app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   console.log(`Mode: LIVE TRADING on Arbitrum One`);
   console.log(`Internal cron: ${USE_INTERNAL_CRON ? `every ${CRON_MINUTES} min` : "DISABLED (use external cron)"}`);
-  console.log(`GROQ_API_KEY: ${process.env.GROQ_API_KEY ? "set" : "NOT SET"}`);
+  console.log(`CEREBRAS_API_KEY: ${process.env.CEREBRAS_API_KEY ? "set" : "NOT SET"}`);
   console.log(`WALLET_PRIVATE_KEY: ${process.env.WALLET_PRIVATE_KEY ? "set" : "NOT SET"}`);
 });

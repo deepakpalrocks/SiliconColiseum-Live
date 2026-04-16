@@ -1,13 +1,14 @@
 /**
- * Crypto sentiment analysis via Groq.
- * Accepts a pre-configured OpenAI-compatible client (from groqPool).
+ * Crypto sentiment analysis via Cerebras LLM.
  */
+
+import { groqChatWithRetry } from "./groqPool.js";
 
 export async function fetchTwitterSentiment(client, tokens) {
   try {
-    const model = process.env.SENTIMENT_MODEL || "llama-3.1-8b-instant";
+    const model = process.env.SENTIMENT_MODEL || "llama3.1-8b";
 
-    const response = await client.chat.completions.create({
+    const response = await groqChatWithRetry({
       model,
       messages: [
         {
@@ -24,7 +25,7 @@ export async function fetchTwitterSentiment(client, tokens) {
     });
 
     const content = response.choices?.[0]?.message?.content;
-    if (!content) throw new Error("Empty response from Groq");
+    if (!content) throw new Error("Empty response from LLM");
 
     const parsed = JSON.parse(content);
     const arr = Array.isArray(parsed)

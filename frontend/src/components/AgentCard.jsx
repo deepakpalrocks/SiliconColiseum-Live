@@ -8,12 +8,8 @@ const RISK_COLORS = {
 };
 
 export default function AgentCard({ agent }) {
-  const pnl = agent.total_value
-    ? agent.total_value - agent.initial_budget
-    : 0;
-  const pnlPct = agent.initial_budget > 0
-    ? (pnl / agent.initial_budget) * 100
-    : 0;
+  const pnl = agent.pnl ?? 0;
+  const pnlPct = agent.pnl_percent ?? 0;
   const isPositive = pnl >= 0;
 
   return (

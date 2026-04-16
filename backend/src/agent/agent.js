@@ -150,8 +150,10 @@ export async function runTradeAgent(
   sentimentData = [],
   personality = ""
 ) {
-  const model = process.env.TRADE_MODEL || "llama-3.3-70b-versatile";
-  const response = await client.chat.completions.create({
+  // Import retry wrapper - falls back to direct client if not available
+  const { groqChatWithRetry } = await import("../services/groqPool.js");
+  const model = process.env.TRADE_MODEL || "llama3.1-8b";
+  const params = {
     model,
     messages: [
       { role: "system", content: systemPrompt(personality) },
@@ -159,10 +161,11 @@ export async function runTradeAgent(
     ],
     response_format: { type: "json_object" },
     temperature: 0.5, // Lower temp for more consistent real-money decisions
-  });
+  };
+  const response = await groqChatWithRetry(params);
 
   const choice = response.choices[0];
-  if (!choice) throw new Error("No response from Groq");
+  if (!choice) throw new Error("No response from LLM");
 
   const raw = choice.message.content;
   try {

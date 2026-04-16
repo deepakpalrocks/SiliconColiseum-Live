@@ -2,68 +2,149 @@ import { Router } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { queryAll, queryOne, execute } from "../db/database.js";
 import { ARBITRUM_TOKENS } from "../services/tokens.js";
+import { fetchMultipleTokens } from "../services/market.js";
 
 const router = Router();
 
+/**
+ * Enrich holdings with current market prices and compute PNL
+ */
+function computeAgentPnl(agent, holdings, prices) {
+  let holdingsValue = 0;
+  const enrichedHoldings = holdings.map((h) => {
+    const marketData = prices.get(h.token);
+    const currentPrice = marketData?.priceUsd || 0;
+    const value = currentPrice * h.amount;
+    holdingsValue += value;
+    return {
+      ...h,
+      current_price: currentPrice,
+      value,
+      pnl_percent:
+        currentPrice > 0 && h.avg_buy_price > 0
+          ? ((currentPrice - h.avg_buy_price) / h.avg_buy_price) * 100
+          : 0,
+    };
+  });
+
+  const totalValue = agent.current_balance + holdingsValue;
+  const pnl = totalValue - agent.initial_budget;
+  const pnlPercent = agent.initial_budget > 0 ? (pnl / agent.initial_budget) * 100 : 0;
+
+  return {
+    holdings: enrichedHoldings,
+    holdings_value: holdingsValue,
+    total_value: totalValue,
+    pnl,
+    pnl_percent: pnlPercent,
+  };
+}
+
 // GET /api/agents - list all agents (optionally filter by user_id)
-router.get("/", (req, res) => {
-  const { user_id } = req.query;
+router.get("/", async (req, res) => {
+  try {
+    const { user_id } = req.query;
 
-  let agents;
-  if (user_id) {
-    agents = queryAll(
-      `SELECT a.*, u.username as owner FROM agents a
-       LEFT JOIN users u ON a.user_id = u.id
-       WHERE a.user_id = ? ORDER BY a.created_at DESC`,
-      [user_id]
-    );
-  } else {
-    agents = queryAll(
-      `SELECT a.*, u.username as owner FROM agents a
-       LEFT JOIN users u ON a.user_id = u.id
-       ORDER BY a.created_at DESC`
-    );
+    let agents;
+    if (user_id) {
+      agents = queryAll(
+        `SELECT a.*, u.username as owner FROM agents a
+         LEFT JOIN users u ON a.user_id = u.id
+         WHERE a.user_id = ? ORDER BY a.created_at DESC`,
+        [user_id]
+      );
+    } else {
+      agents = queryAll(
+        `SELECT a.*, u.username as owner FROM agents a
+         LEFT JOIN users u ON a.user_id = u.id
+         ORDER BY a.created_at DESC`
+      );
+    }
+
+    // Collect all holdings and unique tokens for price fetch
+    const allHoldings = new Map();
+    const uniqueTokens = new Set();
+    for (const a of agents) {
+      const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [a.id]);
+      allHoldings.set(a.id, holdings);
+      for (const h of holdings) uniqueTokens.add(h.token);
+    }
+
+    // Fetch live prices once for all tokens
+    let prices = new Map();
+    if (uniqueTokens.size > 0) {
+      try {
+        prices = await fetchMultipleTokens([...uniqueTokens]);
+      } catch (err) {
+        console.warn("[AGENTS] Failed to fetch prices for PNL:", err.message);
+      }
+    }
+
+    const result = agents.map((a) => {
+      const holdings = allHoldings.get(a.id) || [];
+      const pnlData = computeAgentPnl(a, holdings, prices);
+      return {
+        ...a,
+        tokens: JSON.parse(a.tokens),
+        ...pnlData,
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("Agents list error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  const result = agents.map((a) => ({
-    ...a,
-    tokens: JSON.parse(a.tokens),
-    holdings: queryAll("SELECT * FROM holdings WHERE agent_id = ?", [a.id]),
-  }));
-
-  res.json(result);
 });
 
 // GET /api/agents/:id - get a single agent
-router.get("/:id", (req, res) => {
-  const agent = queryOne(
-    `SELECT a.*, u.username as owner FROM agents a
-     LEFT JOIN users u ON a.user_id = u.id
-     WHERE a.id = ?`,
-    [req.params.id]
-  );
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
+router.get("/:id", async (req, res) => {
+  try {
+    const agent = queryOne(
+      `SELECT a.*, u.username as owner FROM agents a
+       LEFT JOIN users u ON a.user_id = u.id
+       WHERE a.id = ?`,
+      [req.params.id]
+    );
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
 
-  const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [agent.id]);
-  const recentTrades = queryAll(
-    "SELECT * FROM trades WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20",
-    [agent.id]
-  );
-  const recentDecisions = queryAll(
-    "SELECT * FROM decisions WHERE agent_id = ? ORDER BY created_at DESC LIMIT 10",
-    [agent.id]
-  );
+    const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [agent.id]);
+    const recentTrades = queryAll(
+      "SELECT * FROM trades WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20",
+      [agent.id]
+    );
+    const recentDecisions = queryAll(
+      "SELECT * FROM decisions WHERE agent_id = ? ORDER BY created_at DESC LIMIT 10",
+      [agent.id]
+    );
 
-  res.json({
-    ...agent,
-    tokens: JSON.parse(agent.tokens),
-    holdings,
-    recentTrades,
-    recentDecisions: recentDecisions.map((d) => ({
-      ...d,
-      raw_json: d.raw_json ? JSON.parse(d.raw_json) : null,
-    })),
-  });
+    // Fetch live prices for PNL
+    const uniqueTokens = [...new Set(holdings.map((h) => h.token))];
+    let prices = new Map();
+    if (uniqueTokens.length > 0) {
+      try {
+        prices = await fetchMultipleTokens(uniqueTokens);
+      } catch (err) {
+        console.warn("[AGENTS] Failed to fetch prices for PNL:", err.message);
+      }
+    }
+
+    const pnlData = computeAgentPnl(agent, holdings, prices);
+
+    res.json({
+      ...agent,
+      tokens: JSON.parse(agent.tokens),
+      ...pnlData,
+      recentTrades,
+      recentDecisions: recentDecisions.map((d) => ({
+        ...d,
+        raw_json: d.raw_json ? JSON.parse(d.raw_json) : null,
+      })),
+    });
+  } catch (err) {
+    console.error("Agent detail error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/agents - create a new agent

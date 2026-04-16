@@ -76,12 +76,9 @@ export default function AgentDetail() {
     return <div className="text-gray-500 text-center py-20">Agent not found</div>;
   }
 
-  const holdingsValue = (agent.holdings || []).reduce((sum, h) => {
-    return sum + (h.amount * (h.avg_buy_price || 0));
-  }, 0);
-  const totalValue = agent.current_balance + holdingsValue;
-  const pnl = totalValue - agent.initial_budget;
-  const pnlPct = agent.initial_budget > 0 ? (pnl / agent.initial_budget) * 100 : 0;
+  const holdingsValue = agent.holdings_value ?? 0;
+  const pnl = agent.pnl ?? 0;
+  const pnlPct = agent.pnl_percent ?? 0;
 
   return (
     <div>
@@ -170,22 +167,37 @@ export default function AgentDetail() {
         <div className="bg-dark-800 border border-dark-600 rounded-lg p-4 mb-6">
           <h2 className="text-lg font-semibold text-white mb-3">Current Holdings</h2>
           <div className="space-y-2">
-            {agent.holdings.map((h) => (
-              <div
-                key={h.token}
-                className="flex items-center justify-between py-2 border-b border-dark-700 last:border-0"
-              >
-                <div className="font-mono font-medium text-white">{h.token}</div>
-                <div className="text-right text-sm">
-                  <div className="text-gray-300 font-mono">
-                    {h.amount.toLocaleString(undefined, { maximumFractionDigits: 4 })} tokens
+            {agent.holdings.map((h) => {
+              const tokenPnl = h.pnl_percent ?? 0;
+              return (
+                <div
+                  key={h.token}
+                  className="flex items-center justify-between py-2 border-b border-dark-700 last:border-0"
+                >
+                  <div>
+                    <div className="font-mono font-medium text-white">{h.token}</div>
+                    {h.value > 0 && (
+                      <div className={`text-xs font-mono ${tokenPnl >= 0 ? "text-accent-green" : "text-accent-red"}`}>
+                        {tokenPnl >= 0 ? "+" : ""}{tokenPnl.toFixed(1)}%
+                      </div>
+                    )}
                   </div>
-                  <div className="text-gray-500">
-                    avg ${h.avg_buy_price}
+                  <div className="text-right text-sm">
+                    <div className="text-gray-300 font-mono">
+                      {h.amount.toLocaleString(undefined, { maximumFractionDigits: 4 })} tokens
+                    </div>
+                    <div className="text-gray-500">
+                      avg ${h.avg_buy_price}{h.current_price > 0 ? ` → $${h.current_price}` : ""}
+                    </div>
+                    {h.value > 0 && (
+                      <div className="text-gray-400 font-mono text-xs">
+                        ≈ ${h.value.toFixed(2)}
+                      </div>
+                    )}
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

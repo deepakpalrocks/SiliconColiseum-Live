@@ -1,54 +1,62 @@
 /**
- * Groq API key pool - rotates through multiple keys to avoid rate limits.
- * Set GROQ_API_KEYS as comma-separated keys in .env
- * Falls back to single GROQ_API_KEY if pool not set.
+ * LLM provider — Cerebras Inference (OpenAI-compatible).
+ * Free tier: 1M tokens/day, 60K tokens/min.
+ *
+ * Env vars:
+ *   CEREBRAS_API_KEY — from https://cloud.cerebras.ai/
  */
 
 import OpenAI from "openai";
 
-let keys = [];
-let currentIndex = 0;
+let client = null;
 
 export function initGroqPool() {
-  const poolStr = process.env.GROQ_API_KEYS;
-  const singleKey = process.env.GROQ_API_KEY;
-
-  if (poolStr) {
-    keys = poolStr.split(",").map((k) => k.trim()).filter(Boolean);
-  }
-  if (singleKey && !keys.includes(singleKey)) {
-    keys.push(singleKey);
+  const key = process.env.CEREBRAS_API_KEY;
+  if (!key) {
+    console.warn("[LLM] No CEREBRAS_API_KEY set — AI features disabled");
+    return 0;
   }
 
-  console.log(`[GROQ] Initialized pool with ${keys.length} API key(s)`);
-  return keys.length;
-}
-
-/**
- * Get the next API key (round-robin)
- */
-export function getNextKey() {
-  if (!keys.length) return null;
-  const key = keys[currentIndex];
-  currentIndex = (currentIndex + 1) % keys.length;
-  return key;
-}
-
-/**
- * Get an OpenAI-compatible client with the next available key
- */
-export function getGroqClient() {
-  const key = getNextKey();
-  if (!key) throw new Error("No Groq API keys available");
-  return new OpenAI({
+  client = new OpenAI({
     apiKey: key,
-    baseURL: "https://api.groq.com/openai/v1",
+    baseURL: "https://api.cerebras.ai/v1",
   });
+
+  console.log("[LLM] Cerebras provider initialized");
+  return 1;
 }
 
 /**
- * Get total number of keys in the pool
+ * Execute a chat completion via Cerebras.
  */
+export async function groqChatWithRetry(params) {
+  if (!client) throw new Error("No LLM provider configured (set CEREBRAS_API_KEY)");
+
+  // Map Groq model names to Cerebras equivalents
+  const model = mapModel(params.model);
+  return client.chat.completions.create({ ...params, model });
+}
+
+function mapModel(requestedModel) {
+  const map = {
+    "llama-3.3-70b-versatile": "llama3.1-8b",
+    "llama-3.1-8b-instant": "llama3.1-8b",
+  };
+  return map[requestedModel] || requestedModel;
+}
+
+export function getGroqClient() {
+  if (!client) throw new Error("No LLM provider configured");
+  return client;
+}
+
 export function getPoolSize() {
-  return keys.length;
+  return client ? 1 : 0;
+}
+
+export function getPoolStatus() {
+  return {
+    provider: "cerebras",
+    configured: !!client,
+  };
 }
