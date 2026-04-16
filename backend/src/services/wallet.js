@@ -104,18 +104,77 @@ export async function approveToken(tokenAddress, spender, amount) {
 /**
  * Send a raw transaction (used for Odos assembled swaps)
  */
+// Max gas cost in USD before skipping a trade
+const MAX_GAS_COST_USD = parseFloat(process.env.MAX_GAS_COST_USD || "0.005");
+
 export async function sendTransaction(txData) {
   if (!wallet) throw new Error("Wallet not initialized");
+
+  // Estimate gas units
+  let gasLimit;
+  const rawGas = txData.gasLimit || txData.gas;
+  if (rawGas) {
+    gasLimit = BigInt(Math.ceil(Number(rawGas) * 1.3));
+  } else {
+    try {
+      const estimated = await wallet.estimateGas({
+        to: txData.to,
+        data: txData.data,
+        value: txData.value || 0n,
+      });
+      gasLimit = estimated * 130n / 100n;
+    } catch (err) {
+      console.warn(`[WALLET] Gas estimation failed, using default 500K: ${err.message}`);
+      gasLimit = 500000n;
+    }
+  }
+
+  // Check estimated gas cost in USD before sending
+  const feeData = await provider.getFeeData();
+  const gasPrice = feeData.gasPrice || 0n;
+  const estimatedCostWei = gasLimit * gasPrice;
+  const estimatedCostEth = parseFloat(ethers.formatEther(estimatedCostWei));
+
+  // Fetch ETH price from a simple heuristic (Arbitrum gas is cheap)
+  // Use coingecko-free or fallback to a reasonable estimate
+  const ethPriceUsd = await getEthPriceUsd();
+  const estimatedCostUsd = estimatedCostEth * ethPriceUsd;
+
+  console.log(`[WALLET] Gas estimate: ${gasLimit} units, ~$${estimatedCostUsd.toFixed(4)} (limit: $${MAX_GAS_COST_USD})`);
+
+  if (estimatedCostUsd > MAX_GAS_COST_USD) {
+    throw new Error(`Gas too expensive: $${estimatedCostUsd.toFixed(4)} > $${MAX_GAS_COST_USD} limit. Skipping trade.`);
+  }
 
   const tx = await wallet.sendTransaction({
     to: txData.to,
     data: txData.data,
     value: txData.value || 0n,
-    gasLimit: txData.gasLimit ? BigInt(Math.ceil(Number(txData.gasLimit) * 1.2)) : undefined,
+    gasLimit,
   });
 
   const receipt = await tx.wait();
   return receipt;
+}
+
+// Cache ETH price for 10 minutes
+let cachedEthPrice = { usd: 2000, fetchedAt: 0 };
+
+async function getEthPriceUsd() {
+  const now = Date.now();
+  if (now - cachedEthPrice.fetchedAt < 10 * 60 * 1000) {
+    return cachedEthPrice.usd;
+  }
+
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd");
+    const data = await res.json();
+    cachedEthPrice = { usd: data.ethereum.usd, fetchedAt: now };
+    return cachedEthPrice.usd;
+  } catch {
+    // Fallback to cached or default
+    return cachedEthPrice.usd;
+  }
 }
 
 /**
