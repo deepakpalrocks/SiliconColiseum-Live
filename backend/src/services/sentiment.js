@@ -6,7 +6,7 @@ import { groqChatWithRetry } from "./groqPool.js";
 
 export async function fetchTwitterSentiment(client, tokens) {
   try {
-    const model = process.env.SENTIMENT_MODEL || "llama-3.3-70b";
+    const model = process.env.SENTIMENT_MODEL || "llama3.1-70b";
 
     const response = await groqChatWithRetry({
       model,

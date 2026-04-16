@@ -294,7 +294,7 @@ export async function runTradeAgent(
   personality = ""
 ) {
   const { groqChatWithRetry } = await import("../services/groqPool.js");
-  const model = process.env.TRADE_MODEL || "llama-3.3-70b";
+  const model = process.env.TRADE_MODEL || "llama3.1-70b";
   const params = {
     model,
     messages: [

@@ -24,8 +24,8 @@ app.use(express.json());
 await initDb();
 console.log("Database initialized");
 
-// Initialize LLM provider pool (Cerebras primary + Groq fallback)
-initGroqPool();
+// Initialize LLM provider (Cerebras — auto-selects best available model)
+await initGroqPool();
 
 // Initialize shared trading wallet
 const wallet = initWallet();
