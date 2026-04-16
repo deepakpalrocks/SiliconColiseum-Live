@@ -1,13 +1,14 @@
 /**
  * Cron job that evaluates trade decisions for all active agents
  * and executes REAL trades via Odos Router on Arbitrum One.
+ * BUYs are bundled into a single transaction for gas efficiency.
  */
 
 import { queryAll, queryOne, execute } from "../db/database.js";
 import { runTradeAgent } from "../agent/agent.js";
 import { fetchMultipleTokens } from "../services/market.js";
 import { fetchTwitterSentiment } from "../services/sentiment.js";
-import { buyTokenWithUSDT, sellTokenForUSDT } from "../services/odos.js";
+import { executeBundledBuy, sellTokenForUSDT } from "../services/odos.js";
 import { getWallet } from "../services/wallet.js";
 import { getGroqClient, getPoolSize } from "../services/groqPool.js";
 
@@ -30,7 +31,7 @@ export async function evaluateAllAgents() {
 
 async function _evaluateAllAgents() {
   if (!getPoolSize()) {
-    console.warn("[CRON] No Groq API keys set, skipping evaluation");
+    console.warn("[CRON] No LLM provider configured, skipping evaluation");
     return;
   }
 
@@ -58,16 +59,15 @@ async function _evaluateAllAgents() {
   console.log(`[CRON] Fetching market data for ${allTokens.size} tokens...`);
   const marketData = await fetchMultipleTokens([...allTokens]);
 
-  // Fetch sentiment per-agent (only their tokens) with rotating keys
   for (const agent of agents) {
     try {
       const agentTokens = JSON.parse(agent.tokens);
       console.log(`[CRON] Fetching sentiment for "${agent.name}" (${agentTokens.length} tokens)...`);
-      const sentimentClient = getGroqClient(); // rotates key
+      const sentimentClient = getGroqClient();
       const sentimentData = await fetchTwitterSentiment(sentimentClient, agentTokens);
-      const tradeClient = getGroqClient(); // rotates to next key
+      const tradeClient = getGroqClient();
       await evaluateAgent(tradeClient, agent, marketData, sentimentData);
-      // 3-second delay between agents to avoid rate limits and nonce issues
+      // 3-second delay between agents
       await new Promise((r) => setTimeout(r, 3000));
     } catch (err) {
       console.error(`[CRON] Error evaluating agent ${agent.name}: ${err.message}`);
@@ -86,8 +86,6 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     if (allMarketData.has(t)) agentMarketData.set(t, allMarketData.get(t));
   }
 
-  const agentSentiment = sentimentData || [];
-
   const cfg = {
     budget: agent.current_balance,
     riskLevel: agent.risk_level,
@@ -101,7 +99,7 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
 
   console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)})...`);
 
-  const decision = await runTradeAgent(client, cfg, agentMarketData, agentSentiment, agent.personality);
+  const decision = await runTradeAgent(client, cfg, agentMarketData, sentimentData || [], agent.personality);
 
   // Log the decision
   execute(
@@ -115,121 +113,170 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     return;
   }
 
-  for (const action of decision.actions) {
+  // Separate BUYs and SELLs
+  const buyActions = decision.actions.filter((a) => a.action === "BUY");
+  const sellActions = decision.actions.filter((a) => a.action === "SELL");
+
+  // Execute SELLs first (to free up USDT for buys)
+  for (const action of sellActions) {
     try {
-      await executeRealTrade(agent, action, agentMarketData);
-      // Wait between trades to avoid nonce collision
-      await new Promise((r) => setTimeout(r, 5000));
+      await executeSell(agent, action, agentMarketData);
     } catch (err) {
-      console.error(`[CRON] Trade execution failed for ${agent.name}/${action.token}: ${err.message}`);
-      // Log the failed trade
-      execute(
-        `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed')`,
-        [agent.id, action.action, action.token, action.amount_usd || 0, 0, 0, action.confidence, `FAILED: ${err.message}`]
-      );
+      console.error(`[CRON] SELL failed for ${agent.name}/${action.token}: ${err.message}`);
+      logFailedTrade(agent.id, action);
+    }
+  }
+
+  // Execute all BUYs in a single bundled transaction
+  if (buyActions.length > 0) {
+    try {
+      await executeBundledBuys(agent, buyActions, agentMarketData);
+    } catch (err) {
+      console.error(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message}`);
+      for (const action of buyActions) logFailedTrade(agent.id, action);
     }
   }
 }
 
 /**
- * Execute a real trade via Odos Router
+ * Execute all BUY actions in a single Odos transaction
  */
-async function executeRealTrade(agent, action, marketData) {
-  const { action: side, token, amount_usd, confidence, reason } = action;
-  const md = marketData.get(token);
-  if (!md) {
-    console.warn(`[CRON] No market data for ${token}, skipping trade`);
-    return;
-  }
-
-  const price = md.priceUsd;
-  if (!price || price <= 0) {
-    console.warn(`[CRON] Invalid price for ${token}, skipping`);
-    return;
-  }
-
-  if (side === "BUY") {
-    const amountUsd = Math.min(amount_usd, agent.current_balance);
-    if (amountUsd < 0.5) {
-      console.warn(`[CRON] Amount too small for BUY ${token}: $${amountUsd}`);
-      return;
+async function executeBundledBuys(agent, buyActions, marketData) {
+  // Filter valid buys with market data
+  const validBuys = [];
+  for (const action of buyActions) {
+    const md = marketData.get(action.token);
+    if (!md || !md.priceUsd || md.priceUsd <= 0) {
+      console.warn(`[CRON] No market data for ${action.token}, skipping`);
+      continue;
     }
+    validBuys.push({ ...action, price: md.priceUsd });
+  }
 
-    console.log(`[CRON] BUY ${token}: $${amountUsd.toFixed(2)} via Odos...`);
+  if (!validBuys.length) return;
 
-    // Execute real swap: USDT -> Token
-    const result = await buyTokenWithUSDT(token, amountUsd, 1.0);
+  // Scale amounts to fit within budget
+  const totalRequested = validBuys.reduce((sum, a) => sum + (a.amount_usd || 0), 0);
+  let budget = agent.current_balance;
 
-    const tokenAmount = result.amountOut;
-    const effectivePrice = tokenAmount > 0 ? amountUsd / tokenAmount : price;
+  if (totalRequested > budget) {
+    const scale = budget / totalRequested;
+    for (const a of validBuys) {
+      a.amount_usd = Math.floor(a.amount_usd * scale * 100) / 100;
+    }
+    console.log(`[CRON] Scaled ${validBuys.length} BUYs from $${totalRequested.toFixed(2)} to $${budget.toFixed(2)}`);
+  }
+
+  // Filter out too-small buys after scaling
+  const buys = validBuys.filter((a) => a.amount_usd >= 0.5);
+  if (!buys.length) {
+    console.warn(`[CRON] All BUY amounts too small after scaling`);
+    return;
+  }
+
+  const totalUsd = buys.reduce((sum, a) => sum + a.amount_usd, 0);
+  console.log(`[CRON] Bundled BUY: $${totalUsd.toFixed(2)} -> ${buys.map((b) => b.token).join(" + ")}`);
+
+  // Execute bundled swap: USDT -> multiple tokens in 1 tx
+  const result = await executeBundledBuy(
+    buys.map((b) => ({ symbol: b.token, amountUsd: b.amount_usd })),
+    1.0 // slippage
+  );
+
+  // Update DB for each token
+  for (const r of result.results) {
+    const action = buys.find((b) => b.token === r.symbol);
+    if (!action) continue;
+
+    const amountUsd = r.amountUsd;
+    const tokenAmount = r.amountOut;
+    const effectivePrice = tokenAmount > 0 ? amountUsd / tokenAmount : action.price;
 
     // Update virtual balance
     execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [amountUsd, agent.id]);
     agent.current_balance -= amountUsd;
 
     // Update holdings
-    const existing = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, token]);
+    const existing = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, r.symbol]);
     if (existing) {
       const newAmount = existing.amount + tokenAmount;
       const newAvg = (existing.avg_buy_price * existing.amount + effectivePrice * tokenAmount) / newAmount;
       execute("UPDATE holdings SET amount = ?, avg_buy_price = ? WHERE id = ?", [newAmount, newAvg, existing.id]);
     } else {
-      execute("INSERT INTO holdings (agent_id, token, amount, avg_buy_price) VALUES (?, ?, ?, ?)", [agent.id, token, tokenAmount, effectivePrice]);
+      execute("INSERT INTO holdings (agent_id, token, amount, avg_buy_price) VALUES (?, ?, ?, ?)", [agent.id, r.symbol, tokenAmount, effectivePrice]);
     }
 
-    // Log trade with tx hash
+    // Log trade
     execute(
       `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
        VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
-      [agent.id, token, amountUsd, effectivePrice, tokenAmount, confidence, reason, result.txHash]
+      [agent.id, r.symbol, amountUsd, effectivePrice, tokenAmount, action.confidence, action.reason, result.txHash]
     );
 
-    console.log(`[CRON] BUY ${token}: $${amountUsd.toFixed(2)} -> ${tokenAmount.toFixed(6)} tokens (tx: ${result.txHash})`);
-
-  } else if (side === "SELL") {
-    const holding = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, token]);
-    if (!holding || holding.amount <= 0) {
-      console.warn(`[CRON] No holdings to sell for ${token}`);
-      return;
-    }
-
-    const maxSellUsd = holding.amount * price;
-    const sellUsd = Math.min(amount_usd, maxSellUsd);
-    const sellTokens = sellUsd / price;
-
-    if (sellTokens < 0.000001) {
-      console.warn(`[CRON] Amount too small for SELL ${token}`);
-      return;
-    }
-
-    console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens via Odos...`);
-
-    // Execute real swap: Token -> USDT
-    const result = await sellTokenForUSDT(token, sellTokens, 1.0);
-
-    const actualUsdtReceived = result.amountOut;
-    const effectivePrice = sellTokens > 0 ? actualUsdtReceived / sellTokens : price;
-    const remainingTokens = holding.amount - sellTokens;
-
-    // Update virtual balance with actual USDT received
-    execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualUsdtReceived, agent.id]);
-    agent.current_balance += actualUsdtReceived;
-
-    // Update holdings
-    if (remainingTokens <= 0.000001) {
-      execute("DELETE FROM holdings WHERE id = ?", [holding.id]);
-    } else {
-      execute("UPDATE holdings SET amount = ? WHERE id = ?", [remainingTokens, holding.id]);
-    }
-
-    // Log trade with tx hash
-    execute(
-      `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
-       VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
-      [agent.id, token, actualUsdtReceived, effectivePrice, sellTokens, confidence, reason, result.txHash]
-    );
-
-    console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens -> $${actualUsdtReceived.toFixed(2)} (tx: ${result.txHash})`);
+    console.log(`[CRON] BUY ${r.symbol}: $${amountUsd.toFixed(2)} -> ${tokenAmount.toFixed(6)} tokens (tx: ${result.txHash})`);
   }
+}
+
+/**
+ * Execute a single SELL via Odos
+ */
+async function executeSell(agent, action, marketData) {
+  const { token, amount_usd, confidence, reason } = action;
+  const md = marketData.get(token);
+  if (!md || !md.priceUsd || md.priceUsd <= 0) {
+    console.warn(`[CRON] No market data for ${token}, skipping SELL`);
+    return;
+  }
+
+  const price = md.priceUsd;
+  const holding = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, token]);
+  if (!holding || holding.amount <= 0) {
+    console.warn(`[CRON] No holdings to sell for ${token}`);
+    return;
+  }
+
+  const maxSellUsd = holding.amount * price;
+  const sellUsd = Math.min(amount_usd, maxSellUsd);
+  const sellTokens = sellUsd / price;
+
+  if (sellTokens < 0.000001) {
+    console.warn(`[CRON] Amount too small for SELL ${token}`);
+    return;
+  }
+
+  console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens via Odos...`);
+
+  const result = await sellTokenForUSDT(token, sellTokens, 1.0);
+
+  const actualUsdtReceived = result.amountOut;
+  const effectivePrice = sellTokens > 0 ? actualUsdtReceived / sellTokens : price;
+  const remainingTokens = holding.amount - sellTokens;
+
+  // Update virtual balance
+  execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualUsdtReceived, agent.id]);
+  agent.current_balance += actualUsdtReceived;
+
+  // Update holdings
+  if (remainingTokens <= 0.000001) {
+    execute("DELETE FROM holdings WHERE id = ?", [holding.id]);
+  } else {
+    execute("UPDATE holdings SET amount = ? WHERE id = ?", [remainingTokens, holding.id]);
+  }
+
+  // Log trade
+  execute(
+    `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+     VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
+    [agent.id, token, actualUsdtReceived, effectivePrice, sellTokens, confidence, reason, result.txHash]
+  );
+
+  console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} -> $${actualUsdtReceived.toFixed(2)} (tx: ${result.txHash})`);
+}
+
+function logFailedTrade(agentId, action) {
+  execute(
+    `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed')`,
+    [agentId, action.action, action.token, action.amount_usd || 0, 0, 0, action.confidence, `FAILED: ${action.reason || ""}`]
+  );
 }

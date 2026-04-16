@@ -1,5 +1,6 @@
 /**
  * Odos Router integration for optimal swap execution on Arbitrum One.
+ * Supports bundled multi-output swaps (1 USDT tx → multiple tokens).
  * https://docs.odos.xyz/
  */
 
@@ -14,35 +15,26 @@ const ARBITRUM_CHAIN_ID = 42161;
 const ODOS_ROUTER_ADDRESS = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
 
 /**
- * Get a swap quote from Odos
- * @param {string} inputTokenAddress - Input token contract address
- * @param {number} inputDecimals - Input token decimals
- * @param {string} outputTokenAddress - Output token contract address
- * @param {number} outputDecimals - Output token decimals
- * @param {number} amountIn - Human-readable amount to swap
+ * Get a swap quote from Odos (supports multiple output tokens)
+ * @param {Array} inputTokens - [{ address, decimals, amount }]
+ * @param {Array} outputTokens - [{ address, decimals, proportion }]
  * @param {number} slippagePercent - Slippage tolerance (default 0.5%)
- * @returns {Object} Quote response with pathId
+ * @returns {Object} Quote response with pathId and outAmounts
  */
-export async function getQuote(inputTokenAddress, inputDecimals, outputTokenAddress, outputDecimals, amountIn, slippagePercent = 0.5) {
+async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
-  const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals).toString();
-
   const body = {
     chainId: ARBITRUM_CHAIN_ID,
-    inputTokens: [
-      {
-        tokenAddress: inputTokenAddress,
-        amount: amountInWei,
-      },
-    ],
-    outputTokens: [
-      {
-        tokenAddress: outputTokenAddress,
-        proportion: 1,
-      },
-    ],
+    inputTokens: inputTokens.map((t) => ({
+      tokenAddress: t.address,
+      amount: ethers.parseUnits(String(t.amount), t.decimals).toString(),
+    })),
+    outputTokens: outputTokens.map((t) => ({
+      tokenAddress: t.address,
+      proportion: t.proportion,
+    })),
     userAddr: walletAddress,
     slippageLimitPercent: slippagePercent,
     referralCode: 0,
@@ -66,37 +58,20 @@ export async function getQuote(inputTokenAddress, inputDecimals, outputTokenAddr
     throw new Error("No pathId in Odos quote response");
   }
 
-  return {
-    pathId: data.pathId,
-    amountIn: amountInWei,
-    amountOut: data.outAmounts?.[0] || "0",
-    amountOutReadable: data.outAmounts?.[0]
-      ? parseFloat(ethers.formatUnits(data.outAmounts[0], outputDecimals))
-      : 0,
-    gasEstimate: data.gasEstimate || 0,
-    priceImpact: data.percentDiff || 0,
-  };
+  return data;
 }
 
 /**
  * Assemble the swap transaction from a quote
- * @param {string} pathId - From getQuote response
- * @returns {Object} Assembled transaction data
  */
-export async function assembleSwap(pathId) {
+async function assembleSwap(pathId) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
-
-  const body = {
-    userAddr: walletAddress,
-    pathId: pathId,
-    simulate: false,
-  };
 
   const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
   });
 
   if (!response.ok) {
@@ -113,15 +88,9 @@ export async function assembleSwap(pathId) {
 }
 
 /**
- * Execute a full swap: quote -> approve -> assemble -> send
- * @param {string} inputSymbol - Input token symbol (e.g. "USDT")
- * @param {string} outputSymbol - Output token symbol (e.g. "WETH")
- * @param {number} amountIn - Human-readable amount to swap
- * @param {number} slippagePercent - Slippage tolerance
- * @returns {Object} { txHash, amountIn, amountOut, ... }
+ * Execute a single swap: one input → one output
  */
 export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippagePercent = 0.5) {
-  // Resolve addresses
   const inputAddress = inputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(inputSymbol);
   const outputAddress = outputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(outputSymbol);
   const inputDecimals = inputSymbol === "USDT" ? USDT_DECIMALS : getTokenDecimals(inputSymbol);
@@ -132,26 +101,26 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
   console.log(`[ODOS] Getting quote: ${amountIn} ${inputSymbol} -> ${outputSymbol}`);
 
-  // Step 1: Get quote
-  const quote = await getQuote(
-    inputAddress, inputDecimals,
-    outputAddress, outputDecimals,
-    amountIn, slippagePercent
+  const quoteData = await getQuoteRaw(
+    [{ address: inputAddress, decimals: inputDecimals, amount: amountIn }],
+    [{ address: outputAddress, proportion: 1 }],
+    slippagePercent
   );
 
-  console.log(`[ODOS] Quote: ${amountIn} ${inputSymbol} -> ${quote.amountOutReadable} ${outputSymbol} (impact: ${quote.priceImpact}%)`);
+  const amountOutReadable = quoteData.outAmounts?.[0]
+    ? parseFloat(ethers.formatUnits(quoteData.outAmounts[0], outputDecimals))
+    : 0;
 
-  // Step 2: Approve input token for Odos router
+  console.log(`[ODOS] Quote: ${amountIn} ${inputSymbol} -> ${amountOutReadable} ${outputSymbol}`);
+
+  // Approve input token
   const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
   await approveToken(inputAddress, ODOS_ROUTER_ADDRESS, amountInWei);
 
-  // Step 3: Assemble transaction
-  const txData = await assembleSwap(quote.pathId);
-
-  // Step 4: Execute transaction
+  // Assemble and execute
+  const txData = await assembleSwap(quoteData.pathId);
   console.log(`[ODOS] Executing swap...`);
   const receipt = await sendTransaction(txData);
-
   console.log(`[ODOS] Swap complete: ${receipt.hash}`);
 
   return {
@@ -159,22 +128,88 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
     inputSymbol,
     outputSymbol,
     amountIn,
-    amountOut: quote.amountOutReadable,
-    priceImpact: quote.priceImpact,
+    amountOut: amountOutReadable,
     gasUsed: receipt.gasUsed?.toString() || "0",
-    blockNumber: receipt.blockNumber,
   };
 }
 
 /**
- * Buy a token with USDT
+ * Bundled BUY: USDT → multiple tokens in a single transaction.
+ * @param {Array} buys - [{ symbol, amountUsd }]
+ * @param {number} slippagePercent
+ * @returns {Object} { txHash, results: [{ symbol, amountUsd, amountOut }] }
+ */
+export async function executeBundledBuy(buys, slippagePercent = 0.5) {
+  if (!buys.length) throw new Error("No buys to execute");
+
+  // Single buy — use simple swap
+  if (buys.length === 1) {
+    const b = buys[0];
+    const result = await executeSwap("USDT", b.symbol, b.amountUsd, slippagePercent);
+    return {
+      txHash: result.txHash,
+      results: [{ symbol: b.symbol, amountUsd: b.amountUsd, amountOut: result.amountOut }],
+    };
+  }
+
+  const totalUsd = buys.reduce((sum, b) => sum + b.amountUsd, 0);
+
+  // Build output tokens with proportions
+  const outputTokens = buys.map((b) => {
+    const address = getTokenAddress(b.symbol);
+    if (!address) throw new Error(`Unknown token: ${b.symbol}`);
+    return {
+      address,
+      decimals: getTokenDecimals(b.symbol),
+      proportion: b.amountUsd / totalUsd,
+      symbol: b.symbol,
+      amountUsd: b.amountUsd,
+    };
+  });
+
+  console.log(`[ODOS] Bundled BUY: $${totalUsd.toFixed(2)} USDT -> ${buys.map((b) => `${b.symbol}($${b.amountUsd})`).join(" + ")}`);
+
+  // Get multi-output quote
+  const quoteData = await getQuoteRaw(
+    [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
+    outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
+    slippagePercent
+  );
+
+  // Parse output amounts
+  const results = outputTokens.map((t, i) => {
+    const amountOut = quoteData.outAmounts?.[i]
+      ? parseFloat(ethers.formatUnits(quoteData.outAmounts[i], t.decimals))
+      : 0;
+    console.log(`[ODOS]   ${t.symbol}: $${t.amountUsd.toFixed(2)} -> ${amountOut.toFixed(6)} tokens`);
+    return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
+  });
+
+  // Approve total USDT
+  const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
+  await approveToken(USDT_ADDRESS, ODOS_ROUTER_ADDRESS, totalWei);
+
+  // Assemble and execute single transaction
+  const txData = await assembleSwap(quoteData.pathId);
+  console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
+  const receipt = await sendTransaction(txData);
+  console.log(`[ODOS] Bundled swap complete: ${receipt.hash}`);
+
+  return {
+    txHash: receipt.hash,
+    results,
+  };
+}
+
+/**
+ * Buy a token with USDT (single swap)
  */
 export async function buyTokenWithUSDT(tokenSymbol, usdtAmount, slippage = 0.5) {
   return executeSwap("USDT", tokenSymbol, usdtAmount, slippage);
 }
 
 /**
- * Sell a token for USDT
+ * Sell a token for USDT (single swap)
  */
 export async function sellTokenForUSDT(tokenSymbol, tokenAmount, slippage = 0.5) {
   return executeSwap(tokenSymbol, "USDT", tokenAmount, slippage);
