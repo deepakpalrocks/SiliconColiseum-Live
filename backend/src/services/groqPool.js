@@ -39,8 +39,9 @@ export async function groqChatWithRetry(params) {
 
 function mapModel(requestedModel) {
   const map = {
-    "llama-3.3-70b-versatile": "llama3.1-8b",
-    "llama-3.1-8b-instant": "llama3.1-8b",
+    "llama-3.3-70b-versatile": "llama-3.3-70b",
+    "llama-3.1-8b-instant": "llama-3.3-70b",
+    "llama3.1-8b": "llama-3.3-70b",
   };
   return map[requestedModel] || requestedModel;
 }
