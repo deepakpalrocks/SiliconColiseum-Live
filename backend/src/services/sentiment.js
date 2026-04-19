@@ -1,23 +1,35 @@
 /**
- * Crypto sentiment analysis via Cerebras LLM.
+ * Crypto sentiment analysis via DeepSeek LLM + real news from CryptoPanic.
  */
 
 import { groqChatWithRetry } from "./groqPool.js";
+import { fetchCryptoNews } from "./news.js";
 
 export async function fetchTwitterSentiment(client, tokens) {
   try {
-    const model = process.env.SENTIMENT_MODEL || "llama3.1-70b";
+    const model = "deepseek-chat";
+
+    // Fetch real news headlines for grounding
+    let newsContext = "";
+    try {
+      const news = await fetchCryptoNews(tokens);
+      if (news.length > 0) {
+        newsContext = "\n\nREAL RECENT NEWS HEADLINES:\n" + news.map((n) => `- [${n.source}] ${n.title} (sentiment: ${n.sentiment || "unknown"})`).join("\n");
+      }
+    } catch {
+      // News fetch failed — continue without it
+    }
 
     const response = await groqChatWithRetry({
       model,
       messages: [
         {
           role: "system",
-          content: `Crypto sentiment analyst. Respond with JSON: { "sentiments": [{ "token": "SYM", "sentimentScore": -1 to 1, "sentiment": "bearish"|"neutral"|"bullish", "buzzLevel": 0-10, "keyThemes": [], "summary": "short" }] }`,
+          content: `You are a crypto sentiment analyst. Analyze sentiment based on the REAL news headlines provided. Do NOT fabricate or hallucinate any news. If no news is provided for a token, return neutral sentiment. Respond with JSON: { "sentiments": [{ "token": "SYM", "sentimentScore": -1 to 1, "sentiment": "bearish"|"neutral"|"bullish", "buzzLevel": 0-10, "keyThemes": [], "summary": "short" }] }`,
         },
         {
           role: "user",
-          content: `Sentiment for: ${tokens.join(", ")}`,
+          content: `Analyze sentiment for: ${tokens.join(", ")}${newsContext}`,
         },
       ],
       response_format: { type: "json_object" },

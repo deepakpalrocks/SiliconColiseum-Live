@@ -11,6 +11,9 @@ import { fetchTwitterSentiment } from "../services/sentiment.js";
 import { executeBundledBuy, sellTokenForUSDT } from "../services/odos.js";
 import { getWallet } from "../services/wallet.js";
 import { getGroqClient, getPoolSize } from "../services/groqPool.js";
+import { fetchCryptoNews } from "../services/news.js";
+import { findRelevantEvents } from "../services/rag.js";
+import { fetchSocialMetrics } from "../services/social.js";
 
 // Lock to prevent concurrent evaluations
 let isEvaluating = false;
@@ -36,10 +39,6 @@ async function _evaluateAllAgents() {
   }
 
   const wallet = getWallet();
-  if (!wallet) {
-    console.warn("[CRON] Wallet not initialized, skipping evaluation");
-    return;
-  }
 
   const agents = queryAll("SELECT * FROM agents WHERE is_active = 1");
   if (!agents.length) {
@@ -99,9 +98,29 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     currentHoldings,
   };
 
-  console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)})...`);
+  // Fetch real news, historical context, and social metrics
+  let newsData = [];
+  let ragEvents = [];
+  let socialData = [];
+  try {
+    newsData = await fetchCryptoNews(tokens);
+  } catch (err) {
+    console.warn(`[CRON] News fetch failed for "${agent.name}": ${err.message}`);
+  }
+  try {
+    ragEvents = findRelevantEvents(tokens, newsData);
+  } catch (err) {
+    console.warn(`[CRON] RAG lookup failed for "${agent.name}": ${err.message}`);
+  }
+  try {
+    socialData = await fetchSocialMetrics(tokens);
+  } catch (err) {
+    console.warn(`[CRON] Social metrics failed for "${agent.name}": ${err.message}`);
+  }
 
-  const decision = await runTradeAgent(client, cfg, agentMarketData, sentimentData || [], agent.personality);
+  console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)}, news: ${newsData.length}, rag: ${ragEvents.length}, social: ${socialData.length})...`);
+
+  const decision = await runTradeAgent(client, cfg, agentMarketData, sentimentData || [], agent.personality, { newsData, ragEvents, socialData });
 
   // Log the decision
   execute(
@@ -119,23 +138,49 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
   const buyActions = decision.actions.filter((a) => a.action === "BUY");
   const sellActions = decision.actions.filter((a) => a.action === "SELL");
 
-  // Execute SELLs first (to free up USDT for buys)
-  for (const action of sellActions) {
-    try {
-      await executeSell(agent, action, agentMarketData);
-    } catch (err) {
-      console.error(`[CRON] SELL failed for ${agent.name}/${action.token}: ${err.message}`);
-      logFailedTrade(agent.id, action);
-    }
-  }
+  const isPaper = agent.trading_mode === "paper";
 
-  // Execute all BUYs in a single bundled transaction
-  if (buyActions.length > 0) {
-    try {
-      await executeBundledBuys(agent, buyActions, agentMarketData);
-    } catch (err) {
-      console.error(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message}`);
-      for (const action of buyActions) logFailedTrade(agent.id, action);
+  if (isPaper) {
+    // Paper trading — simulate trades using market prices
+    for (const action of sellActions) {
+      try {
+        executePaperSell(agent, action, agentMarketData);
+      } catch (err) {
+        console.error(`[CRON] Paper SELL failed for ${agent.name}/${action.token}: ${err.message}`);
+        logFailedTrade(agent.id, action);
+      }
+    }
+    for (const action of buyActions) {
+      try {
+        executePaperBuy(agent, action, agentMarketData);
+      } catch (err) {
+        console.error(`[CRON] Paper BUY failed for ${agent.name}/${action.token}: ${err.message}`);
+        logFailedTrade(agent.id, action);
+      }
+    }
+  } else {
+    // Live trading — execute real trades via Odos
+    if (!wallet) {
+      console.warn(`[CRON] Wallet not initialized, skipping live trades for "${agent.name}"`);
+      return;
+    }
+
+    for (const action of sellActions) {
+      try {
+        await executeSell(agent, action, agentMarketData);
+      } catch (err) {
+        console.error(`[CRON] SELL failed for ${agent.name}/${action.token}: ${err.message}`);
+        logFailedTrade(agent.id, action);
+      }
+    }
+
+    if (buyActions.length > 0) {
+      try {
+        await executeBundledBuys(agent, buyActions, agentMarketData);
+      } catch (err) {
+        console.error(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message}`);
+        for (const action of buyActions) logFailedTrade(agent.id, action);
+      }
     }
   }
 }
@@ -271,6 +316,97 @@ async function executeSell(agent, action, marketData) {
   );
 
   console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} -> $${actualUsdtReceived.toFixed(2)} (tx: ${result.txHash})`);
+}
+
+/**
+ * Paper trading: simulate a BUY using current market price
+ */
+function executePaperBuy(agent, action, marketData) {
+  const md = marketData.get(action.token);
+  if (!md || !md.priceUsd || md.priceUsd <= 0) {
+    console.warn(`[CRON] No market data for ${action.token}, skipping paper BUY`);
+    return;
+  }
+
+  const price = md.priceUsd;
+  let amountUsd = action.amount_usd;
+
+  if (amountUsd > agent.current_balance) {
+    amountUsd = agent.current_balance * 0.95;
+  }
+  if (amountUsd < 5) return;
+
+  const tokenAmount = amountUsd / price;
+
+  // Update virtual balance
+  execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [amountUsd, agent.id]);
+  agent.current_balance -= amountUsd;
+
+  // Update holdings
+  const existing = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
+  if (existing) {
+    const newAmount = existing.amount + tokenAmount;
+    const newAvg = (existing.avg_buy_price * existing.amount + price * tokenAmount) / newAmount;
+    execute("UPDATE holdings SET amount = ?, avg_buy_price = ? WHERE id = ?", [newAmount, newAvg, existing.id]);
+  } else {
+    execute("INSERT INTO holdings (agent_id, token, amount, avg_buy_price) VALUES (?, ?, ?, ?)", [agent.id, action.token, tokenAmount, price]);
+  }
+
+  // Log trade
+  execute(
+    `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+     VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, 'PAPER', 'paper')`,
+    [agent.id, action.token, amountUsd, price, tokenAmount, action.confidence, action.reason]
+  );
+
+  console.log(`[CRON] PAPER BUY ${action.token}: $${amountUsd.toFixed(2)} -> ${tokenAmount.toFixed(6)} tokens @ $${price}`);
+}
+
+/**
+ * Paper trading: simulate a SELL using current market price
+ */
+function executePaperSell(agent, action, marketData) {
+  const md = marketData.get(action.token);
+  if (!md || !md.priceUsd || md.priceUsd <= 0) {
+    console.warn(`[CRON] No market data for ${action.token}, skipping paper SELL`);
+    return;
+  }
+
+  const price = md.priceUsd;
+  const holding = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
+  if (!holding || holding.amount <= 0) {
+    console.warn(`[CRON] No holdings to sell for ${action.token}`);
+    return;
+  }
+
+  const maxSellUsd = holding.amount * price;
+  const sellUsd = Math.min(action.amount_usd, maxSellUsd);
+  const sellTokens = sellUsd / price;
+
+  if (sellTokens < 0.000001) return;
+
+  const actualUsdtReceived = sellTokens * price;
+  const remainingTokens = holding.amount - sellTokens;
+
+  // Update virtual balance
+  execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualUsdtReceived, agent.id]);
+  agent.current_balance += actualUsdtReceived;
+
+  // Update holdings
+  if (remainingTokens <= 0.000001) {
+    execute("DELETE FROM holdings WHERE id = ?", [holding.id]);
+  } else {
+    execute("UPDATE holdings SET amount = ? WHERE id = ?", [remainingTokens, holding.id]);
+  }
+
+  // Log trade
+  execute(
+    `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+     VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, 'PAPER', 'paper')`,
+    [agent.id, action.token, actualUsdtReceived, price, sellTokens, action.confidence, action.reason]
+  );
+
+  console.log(`[CRON] PAPER SELL ${action.token}: ${sellTokens.toFixed(6)} -> $${actualUsdtReceived.toFixed(2)} @ $${price}`);
 }
 
 function logFailedTrade(agentId, action) {

@@ -128,6 +128,23 @@ function migrate() {
     )
   `);
 
+  // Historical events for RAG memory
+  db.run(`
+    CREATE TABLE IF NOT EXISTS historical_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_date TEXT NOT NULL,
+      tokens TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      headline TEXT NOT NULL,
+      description TEXT,
+      market_impact TEXT NOT NULL,
+      price_change_pct REAL,
+      timeframe TEXT,
+      source TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
   // Withdrawal requests
   db.run(`
     CREATE TABLE IF NOT EXISTS withdrawals (
@@ -149,6 +166,14 @@ function migrate() {
   } catch {
     try { db.run("ALTER TABLE trades ADD COLUMN tx_hash TEXT"); } catch {}
     try { db.run("ALTER TABLE trades ADD COLUMN status TEXT DEFAULT 'completed'"); } catch {}
+  }
+
+  // Migration: add trading_mode to agents if missing
+  try {
+    const testStmt3 = db.prepare("SELECT trading_mode FROM agents LIMIT 1");
+    testStmt3.free();
+  } catch {
+    try { db.run("ALTER TABLE agents ADD COLUMN trading_mode TEXT DEFAULT 'live'"); } catch {}
   }
 
   // Migration: add wallet columns to users if missing

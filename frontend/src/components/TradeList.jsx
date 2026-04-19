@@ -69,16 +69,18 @@ export default function TradeList({ trades }) {
                   className={`text-xs font-mono ${
                     trade.status === "completed"
                       ? "text-accent-green"
+                      : trade.status === "paper"
+                      ? "text-cyan-400"
                       : trade.status === "failed"
                       ? "text-accent-red"
                       : "text-yellow-400"
                   }`}
                 >
-                  {trade.status || "completed"}
+                  {trade.status === "paper" ? "PAPER" : trade.status || "completed"}
                 </span>
               </td>
               <td className="py-2 px-2">
-                {trade.tx_hash ? (
+                {trade.tx_hash && trade.tx_hash !== "PAPER" ? (
                   <a
                     href={`https://arbiscan.io/tx/${trade.tx_hash}`}
                     target="_blank"
@@ -88,6 +90,8 @@ export default function TradeList({ trades }) {
                   >
                     {trade.tx_hash.slice(0, 8)}...
                   </a>
+                ) : trade.tx_hash === "PAPER" ? (
+                  <span className="text-xs text-cyan-400 font-mono">simulated</span>
                 ) : (
                   <span className="text-xs text-gray-600">-</span>
                 )}

@@ -51,6 +51,7 @@ export default function CreateAgent() {
   const [form, setForm] = useState({
     name: "",
     risk_level: "balanced",
+    trading_mode: "paper",
     budget: 100,
     tokens: [],
     personality: "",
@@ -103,7 +104,7 @@ export default function CreateAgent() {
     if (!form.name.trim()) return setError("Name is required");
     if (!form.tokens.length) return setError("Select at least one token");
     if (form.budget < 1) return setError("Minimum budget is $1");
-    if (form.budget > userBalance.available) {
+    if (form.trading_mode === "live" && form.budget > userBalance.available) {
       return setError(`Budget exceeds available balance ($${userBalance.available.toFixed(2)}). Deposit more USDT.`);
     }
 
@@ -226,25 +227,7 @@ export default function CreateAgent() {
     );
   }
 
-  if (userBalance.available <= 0) {
-    return (
-      <div className="text-center py-20 bg-dark-800 rounded-lg border border-dark-600 max-w-2xl mx-auto">
-        <p className="text-gray-400 text-lg mb-2">Deposit Required</p>
-        <p className="text-gray-600 text-sm mb-2">
-          You have <span className="text-yellow-400 font-mono">${userBalance.available.toFixed(2)}</span> available.
-        </p>
-        <p className="text-gray-600 text-sm mb-6">
-          Deposit USDT to the shared trading wallet to fund your AI agents.
-        </p>
-        <Link
-          to="/deposit"
-          className="px-6 py-2.5 bg-accent-green/20 border border-accent-green/30 rounded text-accent-green hover:bg-accent-green/30 transition-colors font-medium"
-        >
-          Deposit USDT
-        </Link>
-      </div>
-    );
-  }
+  {/* Removed deposit-required gate — paper trading doesn't need funds */}
 
   // Group tokens by category
   const groupedTokens = {};
@@ -308,6 +291,39 @@ export default function CreateAgent() {
           </div>
         </div>
 
+        {/* Trading Mode */}
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-2">
+            Trading Mode
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, trading_mode: "paper" })}
+              className={`p-3 rounded border text-left transition-all ${
+                form.trading_mode === "paper"
+                  ? "text-cyan-400 border-cyan-400/30 bg-dark-700"
+                  : "border-dark-600 text-gray-400 hover:border-dark-500"
+              }`}
+            >
+              <div className="font-medium text-sm">Paper Trading</div>
+              <div className="text-xs text-gray-500 mt-0.5">Test strategy with simulated trades</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, trading_mode: "live" })}
+              className={`p-3 rounded border text-left transition-all ${
+                form.trading_mode === "live"
+                  ? "text-red-400 border-red-400/30 bg-dark-700"
+                  : "border-dark-600 text-gray-400 hover:border-dark-500"
+              }`}
+            >
+              <div className="font-medium text-sm">Live Trading</div>
+              <div className="text-xs text-gray-500 mt-0.5">Real USDT trades on Arbitrum One</div>
+            </button>
+          </div>
+        </div>
+
         {/* Budget */}
         <div>
           <label className="block text-sm font-medium text-gray-300 mb-1">
@@ -320,12 +336,14 @@ export default function CreateAgent() {
               setForm({ ...form, budget: parseFloat(e.target.value) || 0 })
             }
             min={1}
-            max={userBalance.available}
+            max={form.trading_mode === "paper" ? 100000 : userBalance.available}
             step={1}
             className="w-full bg-dark-800 border border-dark-600 rounded px-3 py-2 text-white font-mono focus:outline-none focus:border-accent-green/50"
           />
           <p className="text-xs text-gray-600 mt-1">
-            Real USDT from your deposited balance (max ${userBalance.available.toFixed(2)})
+            {form.trading_mode === "paper"
+              ? "Virtual budget for simulated trades"
+              : `Real USDT from your deposited balance (max $${userBalance.available.toFixed(2)})`}
           </p>
         </div>
 
@@ -439,17 +457,28 @@ export default function CreateAgent() {
           <p className="text-accent-red text-sm">{error}</p>
         )}
 
-        <div className="bg-dark-800 border border-accent-red/20 rounded p-3 text-xs text-gray-500">
-          <p className="text-accent-red font-medium mb-1">WARNING: Real Money Trading</p>
-          <p>This agent will execute REAL trades using your deposited USDT on Arbitrum One. Trading involves risk of loss.</p>
-        </div>
+        {form.trading_mode === "live" ? (
+          <div className="bg-dark-800 border border-accent-red/20 rounded p-3 text-xs text-gray-500">
+            <p className="text-accent-red font-medium mb-1">WARNING: Real Money Trading</p>
+            <p>This agent will execute REAL trades using your deposited USDT on Arbitrum One. Trading involves risk of loss.</p>
+          </div>
+        ) : (
+          <div className="bg-dark-800 border border-cyan-400/20 rounded p-3 text-xs text-gray-500">
+            <p className="text-cyan-400 font-medium mb-1">Paper Trading Mode</p>
+            <p>This agent will simulate trades using virtual funds. No real transactions will be made.</p>
+          </div>
+        )}
 
         <button
           type="submit"
           disabled={submitting}
-          className="w-full py-3 bg-accent-green/20 border border-accent-green/30 rounded text-accent-green font-medium hover:bg-accent-green/30 disabled:opacity-50 transition-colors"
+          className={`w-full py-3 rounded font-medium disabled:opacity-50 transition-colors ${
+            form.trading_mode === "paper"
+              ? "bg-cyan-500/20 border border-cyan-400/30 text-cyan-400 hover:bg-cyan-500/30"
+              : "bg-accent-green/20 border border-accent-green/30 text-accent-green hover:bg-accent-green/30"
+          }`}
         >
-          {submitting ? "Creating..." : "Deploy Agent (Live Trading)"}
+          {submitting ? "Creating..." : form.trading_mode === "paper" ? "Deploy Agent (Paper Trading)" : "Deploy Agent (Live Trading)"}
         </button>
       </form>
     </div>

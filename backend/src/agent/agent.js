@@ -3,6 +3,8 @@
  * NOTE: Decisions result in REAL on-chain trades via Odos Router on Arbitrum One.
  */
 
+import { formatSocialForPrompt } from "../services/social.js";
+
 const MAX_POSITIONS = 5;
 const MIN_TRADE_USD = 5;
 const MAX_SINGLE_TOKEN_PCT = 0.35; // 35% of budget in one token
@@ -88,7 +90,7 @@ REMEMBER: It's better to NOT trade than to make a bad trade. Cash is a position.
 ${personality ? `\nADDITIONAL STYLE:\n${personality}` : ""}`;
 }
 
-function buildPrompt(cfg, marketData, sentimentData) {
+function buildPrompt(cfg, marketData, sentimentData, newsData = [], ragEvents = [], socialData = []) {
   let p = `BUDGET: $${cfg.budget.toFixed(2)} USDT | Risk: ${cfg.riskLevel}\n\n`;
 
   // Holdings section with P&L
@@ -137,6 +139,29 @@ function buildPrompt(cfg, marketData, sentimentData) {
     }
   } else {
     p += `  No sentiment data available.\n`;
+  }
+
+  // Social hype from Twitter/X (via LunarCrush)
+  if (socialData && socialData.length > 0) {
+    p += formatSocialForPrompt(socialData);
+  }
+
+  // Real news headlines
+  if (newsData.length > 0) {
+    p += `\n═══ REAL NEWS ═══\n`;
+    for (const n of newsData) {
+      p += `  [${n.source}] ${n.title}${n.sentiment ? ` (${n.sentiment})` : ""}\n`;
+    }
+  }
+
+  // Historical context from RAG
+  if (ragEvents.length > 0) {
+    p += `\n═══ HISTORICAL CONTEXT ═══\n`;
+    p += `  Similar past events and their outcomes:\n`;
+    for (const e of ragEvents) {
+      p += `  - ${e.event_date}: ${e.headline} → ${e.market_impact} (${e.price_change_pct > 0 ? "+" : ""}${e.price_change_pct}% in ${e.timeframe})\n`;
+    }
+    p += `  Use these historical patterns to inform your decision, but don't blindly follow them.\n`;
   }
 
   p += `\nACTION REQUIRED: Analyze the above data. Should you trade or hold? Your budget is $${cfg.budget.toFixed(2)}. Every BUY must be >= $${MIN_TRADE_USD}. Total buys must be <= $${(cfg.budget * (1 - RESERVE_PCT)).toFixed(2)}. Respond with JSON only.`;
@@ -291,15 +316,17 @@ export async function runTradeAgent(
   cfg,
   marketData = new Map(),
   sentimentData = [],
-  personality = ""
+  personality = "",
+  { newsData = [], ragEvents = [], socialData = [] } = {}
 ) {
   const { groqChatWithRetry } = await import("../services/groqPool.js");
-  const model = process.env.TRADE_MODEL || "llama3.1-70b";
+  const model = "deepseek-chat";
+  const userContent = buildPrompt(cfg, marketData, sentimentData, newsData, ragEvents, socialData);
   const params = {
     model,
     messages: [
       { role: "system", content: systemPrompt(personality, cfg.budget) },
-      { role: "user", content: buildPrompt(cfg, marketData, sentimentData) },
+      { role: "user", content: userContent },
     ],
     response_format: { type: "json_object" },
     temperature: 0.3,

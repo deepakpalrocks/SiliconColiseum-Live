@@ -149,10 +149,15 @@ router.get("/:id", async (req, res) => {
 
 // POST /api/agents - create a new agent
 router.post("/", async (req, res) => {
-  const { user_id, name, risk_level, budget, tokens, personality } = req.body;
+  const { user_id, name, risk_level, budget, tokens, personality, trading_mode } = req.body;
 
   if (!user_id || !name || !risk_level || !budget || !tokens?.length) {
     return res.status(400).json({ error: "Missing required fields: user_id, name, risk_level, budget, tokens" });
+  }
+
+  const mode = trading_mode || "live";
+  if (mode !== "paper" && mode !== "live") {
+    return res.status(400).json({ error: "trading_mode must be 'paper' or 'live'" });
   }
 
   const validRisks = ["conservative", "balanced", "aggressive", "degen"];
@@ -188,7 +193,8 @@ router.post("/", async (req, res) => {
   const totalAllocated = allocated?.total || 0;
   const remainingBalance = availableBalance - totalAllocated;
 
-  if (budget > remainingBalance) {
+  // Paper mode agents don't require deposited balance (budget is virtual)
+  if (mode === "live" && budget > remainingBalance) {
     return res.status(403).json({
       error: `Insufficient deposited balance. You have $${remainingBalance.toFixed(2)} available ($${availableBalance.toFixed(2)} deposited, $${totalAllocated.toFixed(2)} allocated to agents). Deposit more USDT to the shared wallet.`,
       availableBalance,
@@ -199,9 +205,9 @@ router.post("/", async (req, res) => {
 
   const id = uuidv4();
   execute(
-    `INSERT INTO agents (id, user_id, name, risk_level, initial_budget, current_balance, tokens, personality)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, user_id, name, risk_level, budget, budget, JSON.stringify(tokens), personality || ""]
+    `INSERT INTO agents (id, user_id, name, risk_level, initial_budget, current_balance, tokens, personality, trading_mode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, user_id, name, risk_level, budget, budget, JSON.stringify(tokens), personality || "", mode]
   );
 
   const agent = queryOne("SELECT * FROM agents WHERE id = ?", [id]);

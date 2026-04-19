@@ -24,6 +24,15 @@ export default function AgentCard({ agent }) {
             <span className={`text-xs font-mono ${RISK_COLORS[agent.risk_level]}`}>
               {agent.risk_level.toUpperCase()}
             </span>
+            {agent.trading_mode === "paper" ? (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-400/15 text-cyan-400 border border-cyan-400/20">
+                PAPER
+              </span>
+            ) : (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-accent-green/15 text-accent-green border border-accent-green/20 animate-pulse-green">
+                LIVE
+              </span>
+            )}
             {agent.owner && (
               <span className="text-xs text-gray-500">
                 by {agent.owner}
