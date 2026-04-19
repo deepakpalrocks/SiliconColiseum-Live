@@ -165,6 +165,7 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     }
   } else {
     // Live trading — execute real trades via Odos
+    const wallet = getWallet();
     if (!wallet) {
       console.warn(`[CRON] Wallet not initialized, skipping live trades for "${agent.name}"`);
       return;
