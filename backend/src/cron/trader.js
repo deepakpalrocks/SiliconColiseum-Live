@@ -38,7 +38,12 @@ async function _evaluateAllAgents() {
     return;
   }
 
-  const wallet = getWallet();
+  let wallet = null;
+  try {
+    wallet = getWallet();
+  } catch (err) {
+    console.warn(`[CRON] Wallet not available: ${err.message} (paper trading still works)`);
+  }
 
   const agents = queryAll("SELECT * FROM agents WHERE is_active = 1");
   if (!agents.length) {
