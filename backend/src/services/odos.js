@@ -120,19 +120,20 @@ async function assembleSwapOnce(pathId) {
  * quote (new pathId) and re-assemble instead of retrying a stale pathId.
  */
 async function quoteAndAssemble(inputTokens, outputTokens, slippagePercent = 0.5) {
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 5;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent);
 
     try {
       const txData = await assembleSwapOnce(quoteData.pathId);
+      if (attempt > 1) console.log(`[ODOS] Quote+assemble succeeded on attempt ${attempt}`);
       return { quoteData, txData };
     } catch (err) {
       if (!err.retryable || attempt === MAX_ATTEMPTS) throw err;
 
-      const delay = 3000 + 2000 * attempt; // 5s, 7s — enough to avoid 429
-      console.warn(`[ODOS] Assemble failed (attempt ${attempt}), re-quoting in ${delay / 1000}s... (${err.message})`);
+      const delay = 4000 + 3000 * attempt; // 7s, 10s, 13s, 16s
+      console.warn(`[ODOS] Assemble failed (attempt ${attempt}/${MAX_ATTEMPTS}), re-quoting in ${delay / 1000}s... (${err.message})`);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
