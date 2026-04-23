@@ -24,12 +24,15 @@ const ODOS_ROUTER_V2 = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
 const ODOS_ROUTER_V3 = "0x0D05a7D3448512B78fa8A9e46c4872C88C4a0D05";
 const ODOS_ROUTER_ADDRESS = ODOS_API_KEY ? ODOS_ROUTER_V3 : ODOS_ROUTER_V2;
 
+function odosHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
+  return headers;
+}
+
 /**
- * Get a swap quote from Odos (supports multiple output tokens)
- * @param {Array} inputTokens - [{ address, decimals, amount }]
- * @param {Array} outputTokens - [{ address, decimals, proportion }]
- * @param {number} slippagePercent - Slippage tolerance (default 0.5%)
- * @returns {Object} Quote response with pathId and outAmounts
+ * Get a swap quote from Odos (supports multiple output tokens).
+ * Retries on transient errors (429, 500, 2998, 2999).
  */
 async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
   const walletAddress = getWalletAddress();
@@ -52,15 +55,11 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
     compact: true,
   };
 
-  // Retry up to 4 times — Odos v2 is intermittent during v3 migration
   const MAX_RETRIES = 4;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const headers = { "Content-Type": "application/json" };
-    if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
-
     const response = await fetch(`${ODOS_API_BASE}${ODOS_QUOTE_PATH}`, {
       method: "POST",
-      headers,
+      headers: odosHeaders(),
       body: JSON.stringify(body),
     });
 
@@ -73,55 +72,69 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
     }
 
     const errText = await response.text().catch(() => "unknown");
-    const isRetryable = errText.includes("2998") || errText.includes("2999") || response.status >= 500;
+    const isRetryable = response.status === 429 || response.status >= 500
+      || errText.includes("2998") || errText.includes("2999");
 
     if (!isRetryable || attempt === MAX_RETRIES) {
       throw new Error(`Odos quote failed (${response.status}) after ${attempt} attempts: ${errText}`);
     }
 
-    const delay = 1000 * attempt; // 1s, 2s, 3s backoff
+    const delay = 1500 * attempt;
     console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay}ms...`);
     await new Promise((r) => setTimeout(r, delay));
   }
 }
 
 /**
- * Assemble the swap transaction from a quote
+ * Assemble the swap transaction from a pathId (single attempt, no retry).
  */
-async function assembleSwap(pathId) {
+async function assembleSwapOnce(pathId) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
-  const MAX_RETRIES = 3;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const headers = { "Content-Type": "application/json" };
-    if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
+  const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
+    method: "POST",
+    headers: odosHeaders(),
+    body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
+  });
 
-    const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (data.transaction) {
-        if (attempt > 1) console.log(`[ODOS] Assemble succeeded on attempt ${attempt}`);
-        return data.transaction;
-      }
-      throw new Error("No transaction in Odos assemble response");
-    }
-
+  if (!response.ok) {
     const errText = await response.text().catch(() => "unknown");
-    const isRetryable = response.status === 429 || response.status >= 500 || errText.includes("3110");
+    const retryable = response.status === 429 || response.status >= 500 || errText.includes("3110");
+    const err = new Error(`Odos assemble failed (${response.status}): ${errText}`);
+    err.retryable = retryable;
+    throw err;
+  }
 
-    if (!isRetryable || attempt === MAX_RETRIES) {
-      throw new Error(`Odos assemble failed (${response.status}): ${errText}`);
+  const data = await response.json();
+  if (!data.transaction) {
+    throw new Error("No transaction in Odos assemble response");
+  }
+
+  return data.transaction;
+}
+
+/**
+ * Full quote → assemble with end-to-end retry.
+ * If assemble fails with a retryable error (429, 3110, 500), we get a FRESH
+ * quote (new pathId) and re-assemble instead of retrying a stale pathId.
+ */
+async function quoteAndAssemble(inputTokens, outputTokens, slippagePercent = 0.5) {
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent);
+
+    try {
+      const txData = await assembleSwapOnce(quoteData.pathId);
+      return { quoteData, txData };
+    } catch (err) {
+      if (!err.retryable || attempt === MAX_ATTEMPTS) throw err;
+
+      const delay = 2000 * attempt;
+      console.warn(`[ODOS] Assemble failed (attempt ${attempt}), re-quoting in ${delay}ms... (${err.message})`);
+      await new Promise((r) => setTimeout(r, delay));
     }
-
-    const delay = 1500 * attempt;
-    console.warn(`[ODOS] Assemble attempt ${attempt} failed (${response.status}), retrying in ${delay}ms...`);
-    await new Promise((r) => setTimeout(r, delay));
   }
 }
 
@@ -139,7 +152,7 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
   console.log(`[ODOS] Getting quote: ${amountIn} ${inputSymbol} -> ${outputSymbol}`);
 
-  const quoteData = await getQuoteRaw(
+  const { quoteData, txData } = await quoteAndAssemble(
     [{ address: inputAddress, decimals: inputDecimals, amount: amountIn }],
     [{ address: outputAddress, proportion: 1 }],
     slippagePercent
@@ -150,9 +163,6 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
     : 0;
 
   console.log(`[ODOS] Quote: ${amountIn} ${inputSymbol} -> ${amountOutReadable} ${outputSymbol}`);
-
-  // Assemble first to get the actual router address (v2 vs v3)
-  const txData = await assembleSwap(quoteData.pathId);
 
   // Approve input token for the router from the assemble response
   const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
@@ -209,8 +219,7 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
 
   console.log(`[ODOS] Bundled BUY: $${totalUsd.toFixed(2)} USDT -> ${buys.map((b) => `${b.symbol}($${b.amountUsd})`).join(" + ")}`);
 
-  // Get multi-output quote
-  const quoteData = await getQuoteRaw(
+  const { quoteData, txData } = await quoteAndAssemble(
     [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
     outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
     slippagePercent
@@ -224,9 +233,6 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
     console.log(`[ODOS]   ${t.symbol}: $${t.amountUsd.toFixed(2)} -> ${amountOut.toFixed(6)} tokens`);
     return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
   });
-
-  // Assemble first to get the actual router address (v2 vs v3)
-  const txData = await assembleSwap(quoteData.pathId);
 
   // Approve total USDT for the router from the assemble response
   const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
