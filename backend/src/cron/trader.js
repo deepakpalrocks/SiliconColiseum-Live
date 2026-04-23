@@ -220,13 +220,14 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
         await executeBundledBuys(agent, buyActions, agentMarketData);
       } catch (err) {
         console.warn(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message} — falling back to individual swaps`);
-        // Fallback: try each buy individually so one bad token doesn't block the rest
-        for (const action of buyActions) {
+        // Fallback: try each buy individually with delay to avoid 429 rate limits
+        for (let i = 0; i < buyActions.length; i++) {
+          if (i > 0) await new Promise((r) => setTimeout(r, 2000));
           try {
-            await executeBundledBuys(agent, [action], agentMarketData);
+            await executeBundledBuys(agent, [buyActions[i]], agentMarketData);
           } catch (err2) {
-            console.error(`[CRON] Individual BUY failed for ${agent.name}/${action.token}: ${err2.message}`);
-            logFailedTrade(agent.id, action);
+            console.error(`[CRON] Individual BUY failed for ${agent.name}/${buyActions[i].token}: ${err2.message}`);
+            logFailedTrade(agent.id, buyActions[i]);
           }
         }
       }

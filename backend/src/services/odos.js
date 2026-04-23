@@ -92,26 +92,37 @@ async function assembleSwap(pathId) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
-  const headers = { "Content-Type": "application/json" };
-  if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const headers = { "Content-Type": "application/json" };
+    if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
 
-  const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
-  });
+    const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
+    });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Odos assemble failed (${response.status}): ${errText}`);
+    if (response.ok) {
+      const data = await response.json();
+      if (data.transaction) {
+        if (attempt > 1) console.log(`[ODOS] Assemble succeeded on attempt ${attempt}`);
+        return data.transaction;
+      }
+      throw new Error("No transaction in Odos assemble response");
+    }
+
+    const errText = await response.text().catch(() => "unknown");
+    const isRetryable = response.status === 429 || response.status >= 500 || errText.includes("3110");
+
+    if (!isRetryable || attempt === MAX_RETRIES) {
+      throw new Error(`Odos assemble failed (${response.status}): ${errText}`);
+    }
+
+    const delay = 1500 * attempt;
+    console.warn(`[ODOS] Assemble attempt ${attempt} failed (${response.status}), retrying in ${delay}ms...`);
+    await new Promise((r) => setTimeout(r, delay));
   }
-
-  const data = await response.json();
-  if (!data.transaction) {
-    throw new Error("No transaction in Odos assemble response");
-  }
-
-  return data.transaction;
 }
 
 /**
