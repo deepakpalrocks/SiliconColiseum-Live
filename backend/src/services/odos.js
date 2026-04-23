@@ -19,8 +19,10 @@ if (ODOS_API_KEY) {
   console.warn("[ODOS] No ODOS_API_KEY set — using deprecated v2 API (may be unreliable)");
 }
 
-// Odos Router v2 on Arbitrum One
-const ODOS_ROUTER_ADDRESS = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
+// Odos Router — v3 uses a different contract; resolved dynamically from assemble response
+const ODOS_ROUTER_V2 = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
+const ODOS_ROUTER_V3 = "0x0D05a7D3448512B78fa8A9e46c4872C88C4a0D05";
+const ODOS_ROUTER_ADDRESS = ODOS_API_KEY ? ODOS_ROUTER_V3 : ODOS_ROUTER_V2;
 
 /**
  * Get a swap quote from Odos (supports multiple output tokens)
@@ -138,12 +140,14 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
   console.log(`[ODOS] Quote: ${amountIn} ${inputSymbol} -> ${amountOutReadable} ${outputSymbol}`);
 
-  // Approve input token
-  const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
-  await approveToken(inputAddress, ODOS_ROUTER_ADDRESS, amountInWei);
-
-  // Assemble and execute
+  // Assemble first to get the actual router address (v2 vs v3)
   const txData = await assembleSwap(quoteData.pathId);
+
+  // Approve input token for the router from the assemble response
+  const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
+  await approveToken(inputAddress, txData.to, amountInWei);
+
+  // Execute
   console.log(`[ODOS] Executing swap...`);
   const receipt = await sendTransaction(txData);
   console.log(`[ODOS] Swap complete: ${receipt.hash}`);
@@ -210,12 +214,14 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
     return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
   });
 
-  // Approve total USDT
-  const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
-  await approveToken(USDT_ADDRESS, ODOS_ROUTER_ADDRESS, totalWei);
-
-  // Assemble and execute single transaction
+  // Assemble first to get the actual router address (v2 vs v3)
   const txData = await assembleSwap(quoteData.pathId);
+
+  // Approve total USDT for the router from the assemble response
+  const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
+  await approveToken(USDT_ADDRESS, txData.to, totalWei);
+
+  // Execute single transaction
   console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
   const receipt = await sendTransaction(txData);
   console.log(`[ODOS] Bundled swap complete: ${receipt.hash}`);
