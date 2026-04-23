@@ -1,6 +1,7 @@
 /**
  * Odos Router integration for optimal swap execution on Arbitrum One.
  * Supports bundled multi-output swaps (1 USDT tx → multiple tokens).
+ * Tries v3 enterprise API first, falls back to v2 if v3 assemble fails.
  * https://docs.odos.xyz/
  */
 
@@ -9,32 +10,38 @@ import { getWalletAddress, approveToken, sendTransaction } from "./wallet.js";
 import { USDT_ADDRESS, USDT_DECIMALS, getTokenAddress, getTokenDecimals } from "./tokens.js";
 
 const ODOS_API_KEY = process.env.ODOS_API_KEY || "";
-const ODOS_API_BASE = ODOS_API_KEY ? "https://enterprise-api.odos.xyz" : "https://api.odos.xyz";
-const ODOS_QUOTE_PATH = ODOS_API_KEY ? "/sor/quote/v3" : "/sor/quote/v2";
 const ARBITRUM_CHAIN_ID = 42161;
 
+const V3 = {
+  base: "https://enterprise-api.odos.xyz",
+  quotePath: "/sor/quote/v3",
+  headers: () => ({ "Content-Type": "application/json", "x-api-key": ODOS_API_KEY }),
+};
+
+const V2 = {
+  base: "https://api.odos.xyz",
+  quotePath: "/sor/quote/v2",
+  headers: () => ({ "Content-Type": "application/json" }),
+};
+
 if (ODOS_API_KEY) {
-  console.log("[ODOS] Using v3 enterprise API");
+  console.log("[ODOS] Using v3 enterprise API (v2 fallback enabled)");
 } else {
-  console.warn("[ODOS] No ODOS_API_KEY set — using deprecated v2 API (may be unreliable)");
+  console.warn("[ODOS] No ODOS_API_KEY set — using v2 API only");
 }
 
-// Odos Router — v3 uses a different contract; resolved dynamically from assemble response
+// Odos Router addresses
 const ODOS_ROUTER_V2 = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
 const ODOS_ROUTER_V3 = "0x0D05a7D3448512B78fa8A9e46c4872C88C4a0D05";
 const ODOS_ROUTER_ADDRESS = ODOS_API_KEY ? ODOS_ROUTER_V3 : ODOS_ROUTER_V2;
 
-function odosHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
-  return headers;
-}
-
 /**
- * Get a swap quote from Odos (supports multiple output tokens).
+ * Get a swap quote from Odos using a specific API version.
  * Retries on transient errors (429, 500, 2998, 2999).
  */
-async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
+async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5, api = null) {
+  if (!api) api = ODOS_API_KEY ? V3 : V2;
+
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
@@ -57,9 +64,9 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
 
   const MAX_RETRIES = 4;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const response = await fetch(`${ODOS_API_BASE}${ODOS_QUOTE_PATH}`, {
+    const response = await fetch(`${api.base}${api.quotePath}`, {
       method: "POST",
-      headers: odosHeaders(),
+      headers: api.headers(),
       body: JSON.stringify(body),
     });
 
@@ -79,22 +86,24 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
       throw new Error(`Odos quote failed (${response.status}) after ${attempt} attempts: ${errText}`);
     }
 
-    const delay = 2000 + 1500 * attempt; // 3.5s, 5s, 6.5s
+    const delay = 2000 + 1500 * attempt;
     console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay / 1000}s...`);
     await new Promise((r) => setTimeout(r, delay));
   }
 }
 
 /**
- * Assemble the swap transaction from a pathId (single attempt, no retry).
+ * Assemble the swap transaction from a pathId (single attempt).
  */
-async function assembleSwapOnce(pathId) {
+async function assembleSwapOnce(pathId, api = null) {
+  if (!api) api = ODOS_API_KEY ? V3 : V2;
+
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
-  const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
+  const response = await fetch(`${api.base}/sor/assemble`, {
     method: "POST",
-    headers: odosHeaders(),
+    headers: api.headers(),
     body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
   });
 
@@ -116,25 +125,38 @@ async function assembleSwapOnce(pathId) {
 
 /**
  * Full quote → assemble with end-to-end retry.
- * If assemble fails with a retryable error (429, 3110, 500), we get a FRESH
- * quote (new pathId) and re-assemble instead of retrying a stale pathId.
+ * Tries v3 first (3 attempts), then falls back to v2 (3 attempts).
  */
 async function quoteAndAssemble(inputTokens, outputTokens, slippagePercent = 0.5) {
-  const MAX_ATTEMPTS = 5;
+  const apis = ODOS_API_KEY ? [V3, V2] : [V2];
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent);
+  for (const api of apis) {
+    const label = api === V3 ? "v3" : "v2";
+    const MAX_ATTEMPTS = 3;
 
-    try {
-      const txData = await assembleSwapOnce(quoteData.pathId);
-      if (attempt > 1) console.log(`[ODOS] Quote+assemble succeeded on attempt ${attempt}`);
-      return { quoteData, txData };
-    } catch (err) {
-      if (!err.retryable || attempt === MAX_ATTEMPTS) throw err;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent, api);
+        const txData = await assembleSwapOnce(quoteData.pathId, api);
+        if (attempt > 1 || api === V2) console.log(`[ODOS] ${label} quote+assemble succeeded (attempt ${attempt})`);
+        return { quoteData, txData };
+      } catch (err) {
+        const canRetry = err.retryable && attempt < MAX_ATTEMPTS;
+        if (canRetry) {
+          const delay = 4000 + 3000 * attempt;
+          console.warn(`[ODOS] ${label} attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay / 1000}s... (${err.message})`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
 
-      const delay = 4000 + 3000 * attempt; // 7s, 10s, 13s, 16s
-      console.warn(`[ODOS] Assemble failed (attempt ${attempt}/${MAX_ATTEMPTS}), re-quoting in ${delay / 1000}s... (${err.message})`);
-      await new Promise((r) => setTimeout(r, delay));
+        // If this API version is exhausted, try the next one
+        if (api === V3 && apis.includes(V2)) {
+          console.warn(`[ODOS] v3 failed after ${attempt} attempts, falling back to v2... (${err.message})`);
+          break; // break inner loop, continue to V2
+        }
+
+        throw err; // No more fallbacks
+      }
     }
   }
 }
