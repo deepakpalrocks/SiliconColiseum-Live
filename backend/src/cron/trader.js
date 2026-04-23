@@ -219,8 +219,16 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
       try {
         await executeBundledBuys(agent, buyActions, agentMarketData);
       } catch (err) {
-        console.error(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message}`);
-        for (const action of buyActions) logFailedTrade(agent.id, action);
+        console.warn(`[CRON] Bundled BUY failed for ${agent.name}: ${err.message} — falling back to individual swaps`);
+        // Fallback: try each buy individually so one bad token doesn't block the rest
+        for (const action of buyActions) {
+          try {
+            await executeBundledBuys(agent, [action], agentMarketData);
+          } catch (err2) {
+            console.error(`[CRON] Individual BUY failed for ${agent.name}/${action.token}: ${err2.message}`);
+            logFailedTrade(agent.id, action);
+          }
+        }
       }
     }
   }
@@ -261,7 +269,7 @@ async function executeBundledBuys(agent, buyActions, marketData) {
   }
 
   const totalUsd = buys.reduce((sum, a) => sum + a.amount_usd, 0);
-  console.log(`[CRON] Bundled BUY: $${totalUsd.toFixed(2)} -> ${buys.map((b) => b.token).join(" + ")}`);
+  console.log(`[CRON] Bundled BUY: $${totalUsd.toFixed(2)} -> ${buys.map((b) => `${b.token}($${b.amount_usd.toFixed(2)})`).join(" + ")}`);
 
   // Execute bundled swap: USDT -> multiple tokens in 1 tx
   const result = await executeBundledBuy(
