@@ -8,8 +8,16 @@ import { ethers } from "ethers";
 import { getWalletAddress, approveToken, sendTransaction } from "./wallet.js";
 import { USDT_ADDRESS, USDT_DECIMALS, getTokenAddress, getTokenDecimals } from "./tokens.js";
 
-const ODOS_API_BASE = "https://api.odos.xyz";
+const ODOS_API_KEY = process.env.ODOS_API_KEY || "";
+const ODOS_API_BASE = ODOS_API_KEY ? "https://enterprise-api.odos.xyz" : "https://api.odos.xyz";
+const ODOS_QUOTE_PATH = ODOS_API_KEY ? "/sor/quote/v3" : "/sor/quote/v2";
 const ARBITRUM_CHAIN_ID = 42161;
+
+if (ODOS_API_KEY) {
+  console.log("[ODOS] Using v3 enterprise API");
+} else {
+  console.warn("[ODOS] No ODOS_API_KEY set — using deprecated v2 API (may be unreliable)");
+}
 
 // Odos Router v2 on Arbitrum One
 const ODOS_ROUTER_ADDRESS = "0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13";
@@ -45,9 +53,12 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
   // Retry up to 4 times — Odos v2 is intermittent during v3 migration
   const MAX_RETRIES = 4;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const response = await fetch(`${ODOS_API_BASE}/sor/quote/v2`, {
+    const headers = { "Content-Type": "application/json" };
+    if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
+
+    const response = await fetch(`${ODOS_API_BASE}${ODOS_QUOTE_PATH}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
 
@@ -79,9 +90,12 @@ async function assembleSwap(pathId) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
+  const headers = { "Content-Type": "application/json" };
+  if (ODOS_API_KEY) headers["x-api-key"] = ODOS_API_KEY;
+
   const response = await fetch(`${ODOS_API_BASE}/sor/assemble`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ userAddr: walletAddress, pathId, simulate: false }),
   });
 
