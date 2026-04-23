@@ -79,8 +79,8 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
       throw new Error(`Odos quote failed (${response.status}) after ${attempt} attempts: ${errText}`);
     }
 
-    const delay = 1500 * attempt;
-    console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay}ms...`);
+    const delay = 2000 + 1500 * attempt; // 3.5s, 5s, 6.5s
+    console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay / 1000}s...`);
     await new Promise((r) => setTimeout(r, delay));
   }
 }
@@ -131,8 +131,8 @@ async function quoteAndAssemble(inputTokens, outputTokens, slippagePercent = 0.5
     } catch (err) {
       if (!err.retryable || attempt === MAX_ATTEMPTS) throw err;
 
-      const delay = 2000 * attempt;
-      console.warn(`[ODOS] Assemble failed (attempt ${attempt}), re-quoting in ${delay}ms... (${err.message})`);
+      const delay = 3000 + 2000 * attempt; // 5s, 7s — enough to avoid 429
+      console.warn(`[ODOS] Assemble failed (attempt ${attempt}), re-quoting in ${delay / 1000}s... (${err.message})`);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
