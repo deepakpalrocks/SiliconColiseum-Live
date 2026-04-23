@@ -42,23 +42,34 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5) {
     compact: true,
   };
 
-  const response = await fetch(`${ODOS_API_BASE}/sor/quote/v2`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  // Retry up to 4 times — Odos v2 is intermittent during v3 migration
+  const MAX_RETRIES = 4;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const response = await fetch(`${ODOS_API_BASE}/sor/quote/v2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Odos quote failed (${response.status}): ${errText}`);
+    if (response.ok) {
+      const data = await response.json();
+      if (data.pathId) {
+        if (attempt > 1) console.log(`[ODOS] Quote succeeded on attempt ${attempt}`);
+        return data;
+      }
+    }
+
+    const errText = await response.text().catch(() => "unknown");
+    const isRetryable = errText.includes("2998") || errText.includes("2999") || response.status >= 500;
+
+    if (!isRetryable || attempt === MAX_RETRIES) {
+      throw new Error(`Odos quote failed (${response.status}) after ${attempt} attempts: ${errText}`);
+    }
+
+    const delay = 1000 * attempt; // 1s, 2s, 3s backoff
+    console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay}ms...`);
+    await new Promise((r) => setTimeout(r, delay));
   }
-
-  const data = await response.json();
-  if (!data.pathId) {
-    throw new Error("No pathId in Odos quote response");
-  }
-
-  return data;
 }
 
 /**

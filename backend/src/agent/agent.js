@@ -62,7 +62,7 @@ Read ALL the data below and determine which phase we're in:
 PHASE 1 — CAPITULATION/BOTTOM (F&G ≤25, tokens down 15-40% from recent highs)
   → Market is in EXTREME FEAR. Retail has panic-sold. Headlines are doom and gloom.
   → This is the BEST buying opportunity. Deploy 30-50% of capital.
-  → Look for: High-quality tokens (BTC, ETH, SOL) beaten down with no fundamental flaw.
+  → Look for: ANY token in your watchlist that's beaten down with no fundamental flaw. Spread across multiple tokens, don't just default to majors. Smaller tokens recover harder.
 
 PHASE 2 — EARLY RECOVERY (F&G 25-45, short timeframes turning green, 24h still red)
   → The bleeding has stopped. Smart money is quietly accumulating.
@@ -205,6 +205,7 @@ Before responding, verify:
 3. Is liquidity sufficient for every token I'm considering?
 4. Do my position sizes respect the budget limits?
 5. Am I trading with LOGIC or with EMOTION?
+6. DIVERSIFY: Do NOT always pick the same tokens. Spread buys across your FULL watchlist. Pick tokens showing the best SHORT-TERM momentum (5m/1h), not just blue chips.
 
 If no pattern matches → should_trade: false. But ALWAYS look hard for entries — idle cash loses to compounding traders.
 After ANY profitable sell, you MUST include BUY actions for the next rotation. Sell + Buy in the same decision = continuous compounding.
