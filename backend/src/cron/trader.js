@@ -127,6 +127,41 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
 
   const decision = await runTradeAgent(client, cfg, agentMarketData, sentimentData || [], agent.personality, { newsData, ragEvents, socialData });
 
+  // Momentum-aware forced take-profit (safety net)
+  const tpPctMap = { conservative: 2, balanced: 2, aggressive: 2.5, degen: 2 };
+  const takeProfitPct = tpPctMap[agent.risk_level] || 2;
+  const MIN_PROFIT_USD = 0.10;
+  for (const h of holdings) {
+    const md = agentMarketData.get(h.token);
+    if (!md || !md.priceUsd || md.priceUsd <= 0) continue;
+    const pnlPct = ((md.priceUsd - h.avg_buy_price) / h.avg_buy_price) * 100;
+    const profitUsd = (md.priceUsd - h.avg_buy_price) * h.amount;
+    if (pnlPct >= takeProfitPct && profitUsd >= MIN_PROFIT_USD) {
+      const momentumNegative = (md.priceChange5m || 0) < 0;
+      const hardCap = pnlPct >= 5; // Always sell at 5%+ regardless
+      // Sell if momentum is reversing OR hit hard cap
+      if (momentumNegative || hardCap) {
+        const alreadySelling = decision.actions?.some(a => a.action === 'SELL' && a.token === h.token);
+        if (!alreadySelling) {
+          if (!decision.actions) decision.actions = [];
+          const reason = hardCap
+            ? `Auto take-profit (hard cap): +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)} profit)`
+            : `Auto take-profit (momentum reversal): +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)} profit, 5m: ${(md.priceChange5m || 0).toFixed(2)}%)`;
+          decision.actions.push({
+            action: 'SELL',
+            token: h.token,
+            amount_usd: h.amount * md.priceUsd,
+            confidence: 0.95,
+            urgency: 'high',
+            reason
+          });
+          decision.should_trade = true;
+          console.log(`[CRON] ${hardCap ? 'Hard cap' : 'Momentum'} take-profit for "${agent.name}" ${h.token}: +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)}, 5m: ${(md.priceChange5m || 0).toFixed(2)}%)`);
+        }
+      }
+    }
+  }
+
   // Log the decision
   execute(
     `INSERT INTO decisions (agent_id, should_trade, reasoning, market_analysis, raw_json)
@@ -231,7 +266,7 @@ async function executeBundledBuys(agent, buyActions, marketData) {
   // Execute bundled swap: USDT -> multiple tokens in 1 tx
   const result = await executeBundledBuy(
     buys.map((b) => ({ symbol: b.token, amountUsd: b.amount_usd })),
-    1.0 // slippage
+    0.5 // slippage
   );
 
   // Update DB for each token
@@ -297,7 +332,7 @@ async function executeSell(agent, action, marketData) {
 
   console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens via Odos...`);
 
-  const result = await sellTokenForUSDT(token, sellTokens, 1.0);
+  const result = await sellTokenForUSDT(token, sellTokens, 0.5);
 
   const actualUsdtReceived = result.amountOut;
   const effectivePrice = sellTokens > 0 ? actualUsdtReceived / sellTokens : price;

@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from "uuid";
 import { queryAll, queryOne, execute } from "../db/database.js";
 import { ARBITRUM_TOKENS } from "../services/tokens.js";
 import { fetchMultipleTokens } from "../services/market.js";
+import { sellTokenForUSDT } from "../services/odos.js";
+import { getWallet, transferUSDT } from "../services/wallet.js";
 
 const router = Router();
 
@@ -246,6 +248,101 @@ router.delete("/:id", (req, res) => {
   execute("DELETE FROM decisions WHERE agent_id = ?", [agent.id]);
   execute("DELETE FROM agents WHERE id = ?", [agent.id]);
   res.json({ success: true });
+});
+
+// POST /api/agents/:id/exit - sell all holdings, transfer USDT to owner wallet
+router.post("/:id/exit", async (req, res) => {
+  const { user_id } = req.body;
+  const agent = queryOne("SELECT * FROM agents WHERE id = ?", [req.params.id]);
+  if (!agent) return res.status(404).json({ error: "Agent not found" });
+  if (!user_id || agent.user_id !== user_id) {
+    return res.status(403).json({ error: "Only the owner can exit this agent" });
+  }
+
+  const user = queryOne("SELECT wallet_address FROM users WHERE id = ?", [user_id]);
+  if (!user?.wallet_address) {
+    return res.status(400).json({ error: "No wallet address found for user" });
+  }
+
+  // Deactivate immediately to prevent new trades
+  execute("UPDATE agents SET is_active = 0 WHERE id = ?", [agent.id]);
+
+  const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [agent.id]);
+  const isPaper = agent.trading_mode === "paper";
+  let totalProceeds = agent.current_balance;
+  const sellResults = [];
+
+  // Sell all holdings
+  for (const h of holdings) {
+    if (h.amount <= 0.000001) continue;
+
+    try {
+      if (isPaper) {
+        // Paper: use market price for virtual liquidation
+        const prices = await fetchMultipleTokens([h.token]);
+        const md = prices.get(h.token);
+        const price = md?.priceUsd || h.avg_buy_price;
+        const proceeds = h.amount * price;
+        totalProceeds += proceeds;
+        sellResults.push({ token: h.token, proceeds, status: "paper" });
+      } else {
+        // Live: sell via Odos
+        const result = await sellTokenForUSDT(h.token, h.amount, 0.5);
+        const proceeds = result.amountOut;
+        totalProceeds += proceeds;
+        sellResults.push({ token: h.token, proceeds, txHash: result.txHash, status: "completed" });
+
+        // Log the exit trade
+        execute(
+          `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+           VALUES (?, 'SELL', ?, ?, ?, ?, 1.0, 'Exit strategy - full liquidation', ?, 'completed')`,
+          [agent.id, h.token, proceeds, proceeds / h.amount, h.amount, result.txHash]
+        );
+      }
+    } catch (err) {
+      console.error(`[EXIT] Failed to sell ${h.token}: ${err.message}`);
+      sellResults.push({ token: h.token, proceeds: 0, status: "failed", error: err.message });
+    }
+  }
+
+  // Transfer USDT to owner wallet (live mode only)
+  let transferResult = null;
+  if (!isPaper && totalProceeds > 0.01) {
+    try {
+      const wallet = getWallet();
+      if (!wallet) throw new Error("Wallet not initialized");
+      transferResult = await transferUSDT(user.wallet_address, totalProceeds);
+    } catch (err) {
+      console.error(`[EXIT] USDT transfer failed: ${err.message}`);
+      return res.status(500).json({
+        error: `Holdings sold but transfer failed: ${err.message}. USDT is still in the shared wallet. Contact support.`,
+        sellResults,
+        totalProceeds,
+      });
+    }
+  }
+
+  // Clean up agent data
+  execute("DELETE FROM holdings WHERE agent_id = ?", [agent.id]);
+  execute("UPDATE agents SET current_balance = 0 WHERE id = ?", [agent.id]);
+
+  // Record withdrawal
+  if (transferResult) {
+    execute(
+      `INSERT INTO withdrawals (user_id, to_address, amount, tx_hash, status)
+       VALUES (?, ?, ?, ?, 'completed')`,
+      [user_id, user.wallet_address, totalProceeds, transferResult.txHash]
+    );
+  }
+
+  res.json({
+    success: true,
+    totalProceeds: parseFloat(totalProceeds.toFixed(2)),
+    toAddress: user.wallet_address,
+    txHash: transferResult?.txHash || null,
+    isPaper,
+    sellResults,
+  });
 });
 
 export default router;

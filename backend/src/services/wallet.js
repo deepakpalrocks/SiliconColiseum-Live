@@ -175,6 +175,31 @@ async function getEthPriceUsd() {
 }
 
 /**
+ * Transfer USDT to an external address (for exit/withdrawal)
+ */
+export async function transferUSDT(toAddress, amountUsd) {
+  if (!wallet) throw new Error("Wallet not initialized");
+  if (!toAddress || !ethers.isAddress(toAddress)) throw new Error("Invalid destination address");
+  if (amountUsd <= 0) throw new Error("Amount must be positive");
+
+  const contract = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, wallet);
+  const amountWei = ethers.parseUnits(String(amountUsd.toFixed(USDT_DECIMALS)), USDT_DECIMALS);
+
+  // Check balance
+  const balance = await contract.balanceOf(wallet.address);
+  if (balance < amountWei) {
+    throw new Error(`Insufficient USDT balance. Have ${ethers.formatUnits(balance, USDT_DECIMALS)}, need ${amountUsd}`);
+  }
+
+  console.log(`[WALLET] Transferring ${amountUsd} USDT to ${toAddress}...`);
+  const tx = await contract.transfer(toAddress, amountWei);
+  const receipt = await tx.wait();
+  console.log(`[WALLET] USDT transfer complete: ${receipt.hash}`);
+
+  return { txHash: receipt.hash, amount: amountUsd, to: toAddress };
+}
+
+/**
  * Get all token balances for the wallet
  */
 export async function getAllTokenBalances(symbols) {

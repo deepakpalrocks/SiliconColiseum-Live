@@ -32,6 +32,8 @@ export const toggleAgent = (id, user_id) =>
   request(`/agents/${id}/toggle`, { method: "PATCH", body: JSON.stringify({ user_id }) });
 export const deleteAgent = (id, user_id) =>
   request(`/agents/${id}`, { method: "DELETE", body: JSON.stringify({ user_id }) });
+export const exitAgent = (id, user_id) =>
+  request(`/agents/${id}/exit`, { method: "POST", body: JSON.stringify({ user_id }) });
 
 // Trades
 export const getAgentTrades = (agentId, limit = 50) =>

@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { getAgent, toggleAgent, deleteAgent, triggerEvaluation } from "../api/client";
+import { getAgent, toggleAgent, deleteAgent, exitAgent, triggerEvaluation } from "../api/client";
 import { useAuth } from "../context/AuthContext";
 import TradeList from "../components/TradeList";
 
@@ -18,6 +18,7 @@ export default function AgentDetail() {
   const [agent, setAgent] = useState(null);
   const [loading, setLoading] = useState(true);
   const [evaluating, setEvaluating] = useState(false);
+  const [exiting, setExiting] = useState(false);
   const [showDecisions, setShowDecisions] = useState(false);
 
   useEffect(() => {
@@ -65,6 +66,27 @@ export default function AgentDetail() {
       alert(err.message);
     } finally {
       setEvaluating(false);
+    }
+  }
+
+  async function handleExit() {
+    const msg = agent.trading_mode === "paper"
+      ? "Liquidate all holdings and close this agent? (Paper mode - no real transfers)"
+      : "Sell ALL holdings for USDT and transfer to your wallet? This cannot be undone!";
+    if (!confirm(msg)) return;
+    setExiting(true);
+    try {
+      const result = await exitAgent(id, user?.id);
+      if (result.isPaper) {
+        alert(`Agent exited! Final value: $${result.totalProceeds}`);
+      } else {
+        alert(`Exit complete! $${result.totalProceeds} USDT sent to ${result.toAddress}\nTx: ${result.txHash}`);
+      }
+      navigate("/");
+    } catch (err) {
+      alert(`Exit failed: ${err.message}`);
+    } finally {
+      setExiting(false);
     }
   }
 
@@ -135,6 +157,13 @@ export default function AgentDetail() {
                 }`}
               >
                 {agent.is_active ? "Pause" : "Activate"}
+              </button>
+              <button
+                onClick={handleExit}
+                disabled={exiting}
+                className="px-3 py-1.5 rounded text-sm font-medium border border-yellow-500/30 text-yellow-400 hover:bg-yellow-500/10 disabled:opacity-50"
+              >
+                {exiting ? "Exiting..." : "Exit & Withdraw"}
               </button>
               <button
                 onClick={handleDelete}
