@@ -1,24 +1,26 @@
 /**
  * Odos Router integration for optimal swap execution on Arbitrum One.
  * Supports bundled multi-output swaps (1 USDT tx → multiple tokens).
- * Tries v3 enterprise API first, falls back to v2 if v3 assemble fails.
+ * Tries v3 enterprise API first, simulates tx, falls back to v2 if v3 reverts.
  * https://docs.odos.xyz/
  */
 
 import { ethers } from "ethers";
-import { getWalletAddress, approveToken, sendTransaction } from "./wallet.js";
+import { getWalletAddress, getProvider, approveToken, sendTransaction } from "./wallet.js";
 import { USDT_ADDRESS, USDT_DECIMALS, getTokenAddress, getTokenDecimals } from "./tokens.js";
 
 const ODOS_API_KEY = process.env.ODOS_API_KEY || "";
 const ARBITRUM_CHAIN_ID = 42161;
 
 const V3 = {
+  label: "v3",
   base: "https://enterprise-api.odos.xyz",
   quotePath: "/sor/quote/v3",
   headers: () => ({ "Content-Type": "application/json", "x-api-key": ODOS_API_KEY }),
 };
 
 const V2 = {
+  label: "v2",
   base: "https://api.odos.xyz",
   quotePath: "/sor/quote/v2",
   headers: () => ({ "Content-Type": "application/json" }),
@@ -37,11 +39,8 @@ const ODOS_ROUTER_ADDRESS = ODOS_API_KEY ? ODOS_ROUTER_V3 : ODOS_ROUTER_V2;
 
 /**
  * Get a swap quote from Odos using a specific API version.
- * Retries on transient errors (429, 500, 2998, 2999).
  */
-async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5, api = null) {
-  if (!api) api = ODOS_API_KEY ? V3 : V2;
-
+async function getQuoteRaw(inputTokens, outputTokens, slippagePercent, api) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
@@ -73,7 +72,7 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5, api
     if (response.ok) {
       const data = await response.json();
       if (data.pathId) {
-        if (attempt > 1) console.log(`[ODOS] Quote succeeded on attempt ${attempt}`);
+        if (attempt > 1) console.log(`[ODOS] ${api.label} quote succeeded on attempt ${attempt}`);
         return data;
       }
     }
@@ -83,11 +82,11 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5, api
       || errText.includes("2998") || errText.includes("2999");
 
     if (!isRetryable || attempt === MAX_RETRIES) {
-      throw new Error(`Odos quote failed (${response.status}) after ${attempt} attempts: ${errText}`);
+      throw new Error(`Odos ${api.label} quote failed (${response.status}): ${errText}`);
     }
 
     const delay = 2000 + 1500 * attempt;
-    console.warn(`[ODOS] Quote attempt ${attempt} failed (${response.status}), retrying in ${delay / 1000}s...`);
+    console.warn(`[ODOS] ${api.label} quote attempt ${attempt} failed (${response.status}), retrying in ${delay / 1000}s...`);
     await new Promise((r) => setTimeout(r, delay));
   }
 }
@@ -95,9 +94,7 @@ async function getQuoteRaw(inputTokens, outputTokens, slippagePercent = 0.5, api
 /**
  * Assemble the swap transaction from a pathId (single attempt).
  */
-async function assembleSwapOnce(pathId, api = null) {
-  if (!api) api = ODOS_API_KEY ? V3 : V2;
-
+async function assembleSwapOnce(pathId, api) {
   const walletAddress = getWalletAddress();
   if (!walletAddress) throw new Error("Wallet not initialized");
 
@@ -109,56 +106,89 @@ async function assembleSwapOnce(pathId, api = null) {
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "unknown");
-    const retryable = response.status === 429 || response.status >= 500 || errText.includes("3110");
-    const err = new Error(`Odos assemble failed (${response.status}): ${errText}`);
-    err.retryable = retryable;
+    const err = new Error(`Odos ${api.label} assemble failed (${response.status}): ${errText}`);
+    err.retryable = response.status === 429 || response.status >= 500 || errText.includes("3110");
     throw err;
   }
 
   const data = await response.json();
   if (!data.transaction) {
-    throw new Error("No transaction in Odos assemble response");
+    throw new Error(`No transaction in Odos ${api.label} assemble response`);
   }
 
   return data.transaction;
 }
 
 /**
- * Full quote → assemble with end-to-end retry.
- * Tries v3 first (3 attempts), then falls back to v2 (3 attempts).
+ * Simulate a transaction with eth_call to check if it would revert.
+ * Returns true if simulation succeeds, false if it reverts.
  */
-async function quoteAndAssemble(inputTokens, outputTokens, slippagePercent = 0.5) {
+async function simulateTx(txData) {
+  const provider = getProvider();
+  if (!provider) return true; // Skip simulation if no provider
+
+  try {
+    await provider.call({
+      to: txData.to,
+      data: txData.data,
+      value: txData.value || "0",
+      from: txData.from || getWalletAddress(),
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[ODOS] Simulation reverted: ${err.message?.substring(0, 120)}`);
+    return false;
+  }
+}
+
+/**
+ * Full quote → assemble → simulate with v3→v2 fallback.
+ * If v3 assembles but simulation shows revert, falls back to v2.
+ */
+async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent = 0.5) {
   const apis = ODOS_API_KEY ? [V3, V2] : [V2];
 
   for (const api of apis) {
-    const label = api === V3 ? "v3" : "v2";
     const MAX_ATTEMPTS = 3;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent, api);
         const txData = await assembleSwapOnce(quoteData.pathId, api);
-        if (attempt > 1 || api === V2) console.log(`[ODOS] ${label} quote+assemble succeeded (attempt ${attempt})`);
+
+        // Simulate before returning — catches on-chain reverts without spending gas
+        const simOk = await simulateTx(txData);
+        if (!simOk) {
+          const err = new Error(`${api.label} transaction would revert (simulation failed)`);
+          err.retryable = true;
+          throw err;
+        }
+
+        if (attempt > 1 || api === V2) {
+          console.log(`[ODOS] ${api.label} quote+assemble+simulate OK (attempt ${attempt})`);
+        }
         return { quoteData, txData };
       } catch (err) {
         const canRetry = err.retryable && attempt < MAX_ATTEMPTS;
         if (canRetry) {
           const delay = 4000 + 3000 * attempt;
-          console.warn(`[ODOS] ${label} attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay / 1000}s... (${err.message})`);
+          console.warn(`[ODOS] ${api.label} attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay / 1000}s... (${err.message})`);
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
 
         // If this API version is exhausted, try the next one
-        if (api === V3 && apis.includes(V2)) {
-          console.warn(`[ODOS] v3 failed after ${attempt} attempts, falling back to v2... (${err.message})`);
-          break; // break inner loop, continue to V2
+        if (apis.indexOf(api) < apis.length - 1) {
+          console.warn(`[ODOS] ${api.label} exhausted after ${attempt} attempts, trying next... (${err.message})`);
+          break;
         }
 
-        throw err; // No more fallbacks
+        throw err;
       }
     }
   }
+
+  throw new Error("All Odos API versions exhausted");
 }
 
 /**
@@ -175,7 +205,7 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
   console.log(`[ODOS] Getting quote: ${amountIn} ${inputSymbol} -> ${outputSymbol}`);
 
-  const { quoteData, txData } = await quoteAndAssemble(
+  const { quoteData, txData } = await quoteAssembleAndVerify(
     [{ address: inputAddress, decimals: inputDecimals, amount: amountIn }],
     [{ address: outputAddress, proportion: 1 }],
     slippagePercent
@@ -191,7 +221,7 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
   const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
   await approveToken(inputAddress, txData.to, amountInWei);
 
-  // Execute
+  // Execute — simulation already passed, this should succeed
   console.log(`[ODOS] Executing swap...`);
   const receipt = await sendTransaction(txData);
   console.log(`[ODOS] Swap complete: ${receipt.hash}`);
@@ -208,9 +238,6 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
 /**
  * Bundled BUY: USDT → multiple tokens in a single transaction.
- * @param {Array} buys - [{ symbol, amountUsd }]
- * @param {number} slippagePercent
- * @returns {Object} { txHash, results: [{ symbol, amountUsd, amountOut }] }
  */
 export async function executeBundledBuy(buys, slippagePercent = 0.5) {
   if (!buys.length) throw new Error("No buys to execute");
@@ -227,7 +254,6 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
 
   const totalUsd = buys.reduce((sum, b) => sum + b.amountUsd, 0);
 
-  // Build output tokens with proportions
   const outputTokens = buys.map((b) => {
     const address = getTokenAddress(b.symbol);
     if (!address) throw new Error(`Unknown token: ${b.symbol}`);
@@ -242,13 +268,12 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
 
   console.log(`[ODOS] Bundled BUY: $${totalUsd.toFixed(2)} USDT -> ${buys.map((b) => `${b.symbol}($${b.amountUsd})`).join(" + ")}`);
 
-  const { quoteData, txData } = await quoteAndAssemble(
+  const { quoteData, txData } = await quoteAssembleAndVerify(
     [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
     outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
     slippagePercent
   );
 
-  // Parse output amounts
   const results = outputTokens.map((t, i) => {
     const amountOut = quoteData.outAmounts?.[i]
       ? parseFloat(ethers.formatUnits(quoteData.outAmounts[i], t.decimals))
@@ -261,7 +286,7 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
   const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
   await approveToken(USDT_ADDRESS, txData.to, totalWei);
 
-  // Execute single transaction
+  // Execute — simulation already passed
   console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
   const receipt = await sendTransaction(txData);
   console.log(`[ODOS] Bundled swap complete: ${receipt.hash}`);
