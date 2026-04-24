@@ -145,7 +145,7 @@ async function simulateTx(txData) {
  * Full quote → assemble → simulate with v3→v2 fallback.
  * If v3 assembles but simulation shows revert, falls back to v2.
  */
-async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent = 0.5) {
+async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent = 1) {
   const apis = ODOS_API_KEY ? [V3, V2] : [V2];
 
   for (const api of apis) {
@@ -194,7 +194,7 @@ async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent
 /**
  * Execute a single swap: one input → one output
  */
-export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippagePercent = 0.5) {
+export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippagePercent = 1) {
   const inputAddress = inputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(inputSymbol);
   const outputAddress = outputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(outputSymbol);
   const inputDecimals = inputSymbol === "USDT" ? USDT_DECIMALS : getTokenDecimals(inputSymbol);
@@ -243,7 +243,7 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 /**
  * Bundled BUY: USDT → multiple tokens in a single transaction.
  */
-export async function executeBundledBuy(buys, slippagePercent = 0.5) {
+export async function executeBundledBuy(buys, slippagePercent = 1) {
   if (!buys.length) throw new Error("No buys to execute");
 
   // Single buy — use simple swap
@@ -307,14 +307,14 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
 /**
  * Buy a token with USDT (single swap)
  */
-export async function buyTokenWithUSDT(tokenSymbol, usdtAmount, slippage = 0.5) {
+export async function buyTokenWithUSDT(tokenSymbol, usdtAmount, slippage = 1) {
   return executeSwap("USDT", tokenSymbol, usdtAmount, slippage);
 }
 
 /**
  * Sell a token for USDT (single swap)
  */
-export async function sellTokenForUSDT(tokenSymbol, tokenAmount, slippage = 0.5) {
+export async function sellTokenForUSDT(tokenSymbol, tokenAmount, slippage = 1) {
   return executeSwap(tokenSymbol, "USDT", tokenAmount, slippage);
 }
 

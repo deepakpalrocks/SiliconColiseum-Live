@@ -268,7 +268,7 @@ async function executeBundledBuys(agent, buyActions, marketData) {
   // Execute bundled swap: USDT -> multiple tokens in 1 tx
   const result = await executeBundledBuy(
     buys.map((b) => ({ symbol: b.token, amountUsd: b.amount_usd })),
-    0.5 // slippage
+    1 // slippage %
   );
 
   // Update DB for each token
@@ -334,7 +334,7 @@ async function executeSell(agent, action, marketData) {
 
   console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens via Odos...`);
 
-  const result = await sellTokenForUSDT(token, sellTokens, 0.5);
+  const result = await sellTokenForUSDT(token, sellTokens, 1);
 
   const actualUsdtReceived = result.amountOut;
   const effectivePrice = sellTokens > 0 ? actualUsdtReceived / sellTokens : price;
