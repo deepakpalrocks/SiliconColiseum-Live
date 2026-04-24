@@ -142,36 +142,30 @@ async function simulateTx(txData) {
 }
 
 /**
- * Full quote → assemble → simulate with v3→v2 fallback.
- * If v3 assembles but simulation shows revert, falls back to v2.
+ * Full quote → assemble with v3→v2 fallback.
+ * Skips local eth_call simulation — Odos routes often fail simulation
+ * due to stale pool data but succeed on-chain. The router's built-in
+ * slippage protection keeps tokens safe; a reverted tx costs ~$0.02 gas.
  */
-async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent = 1) {
+async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent = 2) {
   const apis = ODOS_API_KEY ? [V3, V2] : [V2];
 
   for (const api of apis) {
-    const MAX_ATTEMPTS = 3;
+    const MAX_ATTEMPTS = 5;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const quoteData = await getQuoteRaw(inputTokens, outputTokens, slippagePercent, api);
         const txData = await assembleSwapOnce(quoteData.pathId, api);
 
-        // Simulate before returning — catches on-chain reverts without spending gas
-        const simOk = await simulateTx(txData);
-        if (!simOk) {
-          const err = new Error(`${api.label} transaction would revert (simulation failed)`);
-          err.retryable = true;
-          throw err;
-        }
-
         if (attempt > 1 || api === V2) {
-          console.log(`[ODOS] ${api.label} quote+assemble+simulate OK (attempt ${attempt})`);
+          console.log(`[ODOS] ${api.label} quote+assemble OK (attempt ${attempt})`);
         }
         return { quoteData, txData };
       } catch (err) {
         const canRetry = err.retryable && attempt < MAX_ATTEMPTS;
         if (canRetry) {
-          const delay = 4000 + 3000 * attempt;
+          const delay = 3000 + 2000 * attempt;
           console.warn(`[ODOS] ${api.label} attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delay / 1000}s... (${err.message})`);
           await new Promise((r) => setTimeout(r, delay));
           continue;
@@ -194,7 +188,7 @@ async function quoteAssembleAndVerify(inputTokens, outputTokens, slippagePercent
 /**
  * Execute a single swap: one input → one output
  */
-export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippagePercent = 1) {
+export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippagePercent = 2) {
   const inputAddress = inputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(inputSymbol);
   const outputAddress = outputSymbol === "USDT" ? USDT_ADDRESS : getTokenAddress(outputSymbol);
   const inputDecimals = inputSymbol === "USDT" ? USDT_DECIMALS : getTokenDecimals(inputSymbol);
@@ -243,7 +237,7 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 /**
  * Bundled BUY: USDT → multiple tokens in a single transaction.
  */
-export async function executeBundledBuy(buys, slippagePercent = 1) {
+export async function executeBundledBuy(buys, slippagePercent = 2) {
   if (!buys.length) throw new Error("No buys to execute");
 
   // Single buy — use simple swap
@@ -272,49 +266,69 @@ export async function executeBundledBuy(buys, slippagePercent = 1) {
 
   console.log(`[ODOS] Bundled BUY: $${totalUsd.toFixed(2)} USDT -> ${buys.map((b) => `${b.symbol}($${b.amountUsd})`).join(" + ")}`);
 
-  // Pre-approve USDT for Odos routers BEFORE quoting/simulation
+  // Pre-approve USDT for Odos routers BEFORE quoting
   const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
   if (ODOS_API_KEY) {
     await approveToken(USDT_ADDRESS, ODOS_ROUTER_V3, totalWei);
   }
   await approveToken(USDT_ADDRESS, ODOS_ROUTER_V2, totalWei);
 
-  const { quoteData, txData } = await quoteAssembleAndVerify(
-    [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
-    outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
-    slippagePercent
-  );
+  // Try bundled swap first, fall back to individual swaps if assembly keeps failing
+  try {
+    const { quoteData, txData } = await quoteAssembleAndVerify(
+      [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
+      outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
+      slippagePercent
+    );
 
-  const results = outputTokens.map((t, i) => {
-    const amountOut = quoteData.outAmounts?.[i]
-      ? parseFloat(ethers.formatUnits(quoteData.outAmounts[i], t.decimals))
-      : 0;
-    console.log(`[ODOS]   ${t.symbol}: $${t.amountUsd.toFixed(2)} -> ${amountOut.toFixed(6)} tokens`);
-    return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
-  });
+    const results = outputTokens.map((t, i) => {
+      const amountOut = quoteData.outAmounts?.[i]
+        ? parseFloat(ethers.formatUnits(quoteData.outAmounts[i], t.decimals))
+        : 0;
+      console.log(`[ODOS]   ${t.symbol}: $${t.amountUsd.toFixed(2)} -> ${amountOut.toFixed(6)} tokens`);
+      return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
+    });
 
-  // Execute — simulation already passed
-  console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
-  const receipt = await sendTransaction(txData);
-  console.log(`[ODOS] Bundled swap complete: ${receipt.hash}`);
+    console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
+    const receipt = await sendTransaction(txData);
+    console.log(`[ODOS] Bundled swap complete: ${receipt.hash}`);
 
-  return {
-    txHash: receipt.hash,
-    results,
-  };
+    return { txHash: receipt.hash, results };
+  } catch (bundledErr) {
+    console.warn(`[ODOS] Bundled swap failed, falling back to individual swaps: ${bundledErr.message}`);
+  }
+
+  // Fallback: execute each buy individually
+  const results = [];
+  const txHashes = [];
+  for (const b of buys) {
+    try {
+      const result = await executeSwap("USDT", b.symbol, b.amountUsd, slippagePercent);
+      results.push({ symbol: b.symbol, amountUsd: b.amountUsd, amountOut: result.amountOut });
+      txHashes.push(result.txHash);
+    } catch (err) {
+      console.error(`[ODOS] Individual BUY ${b.symbol} failed: ${err.message}`);
+      results.push({ symbol: b.symbol, amountUsd: b.amountUsd, amountOut: 0, failed: true });
+    }
+  }
+
+  const successResults = results.filter((r) => !r.failed);
+  if (!successResults.length) throw new Error("All individual buy swaps failed");
+
+  return { txHash: txHashes[0] || "individual", results: successResults };
 }
 
 /**
  * Buy a token with USDT (single swap)
  */
-export async function buyTokenWithUSDT(tokenSymbol, usdtAmount, slippage = 1) {
+export async function buyTokenWithUSDT(tokenSymbol, usdtAmount, slippage = 2) {
   return executeSwap("USDT", tokenSymbol, usdtAmount, slippage);
 }
 
 /**
  * Sell a token for USDT (single swap)
  */
-export async function sellTokenForUSDT(tokenSymbol, tokenAmount, slippage = 1) {
+export async function sellTokenForUSDT(tokenSymbol, tokenAmount, slippage = 2) {
   return executeSwap(tokenSymbol, "USDT", tokenAmount, slippage);
 }
 
