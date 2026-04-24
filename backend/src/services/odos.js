@@ -205,6 +205,14 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
 
   console.log(`[ODOS] Getting quote: ${amountIn} ${inputSymbol} -> ${outputSymbol}`);
 
+  // Pre-approve input token for Odos routers BEFORE quoting/simulation
+  // so that eth_call simulation doesn't revert with "insufficient allowance"
+  const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
+  if (ODOS_API_KEY) {
+    await approveToken(inputAddress, ODOS_ROUTER_V3, amountInWei);
+  }
+  await approveToken(inputAddress, ODOS_ROUTER_V2, amountInWei);
+
   const { quoteData, txData } = await quoteAssembleAndVerify(
     [{ address: inputAddress, decimals: inputDecimals, amount: amountIn }],
     [{ address: outputAddress, proportion: 1 }],
@@ -216,10 +224,6 @@ export async function executeSwap(inputSymbol, outputSymbol, amountIn, slippageP
     : 0;
 
   console.log(`[ODOS] Quote: ${amountIn} ${inputSymbol} -> ${amountOutReadable} ${outputSymbol}`);
-
-  // Approve input token for the router from the assemble response
-  const amountInWei = ethers.parseUnits(String(amountIn), inputDecimals);
-  await approveToken(inputAddress, txData.to, amountInWei);
 
   // Execute — simulation already passed, this should succeed
   console.log(`[ODOS] Executing swap...`);
@@ -268,6 +272,13 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
 
   console.log(`[ODOS] Bundled BUY: $${totalUsd.toFixed(2)} USDT -> ${buys.map((b) => `${b.symbol}($${b.amountUsd})`).join(" + ")}`);
 
+  // Pre-approve USDT for Odos routers BEFORE quoting/simulation
+  const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
+  if (ODOS_API_KEY) {
+    await approveToken(USDT_ADDRESS, ODOS_ROUTER_V3, totalWei);
+  }
+  await approveToken(USDT_ADDRESS, ODOS_ROUTER_V2, totalWei);
+
   const { quoteData, txData } = await quoteAssembleAndVerify(
     [{ address: USDT_ADDRESS, decimals: USDT_DECIMALS, amount: totalUsd }],
     outputTokens.map((t) => ({ address: t.address, proportion: t.proportion })),
@@ -281,10 +292,6 @@ export async function executeBundledBuy(buys, slippagePercent = 0.5) {
     console.log(`[ODOS]   ${t.symbol}: $${t.amountUsd.toFixed(2)} -> ${amountOut.toFixed(6)} tokens`);
     return { symbol: t.symbol, amountUsd: t.amountUsd, amountOut };
   });
-
-  // Approve total USDT for the router from the assemble response
-  const totalWei = ethers.parseUnits(String(totalUsd), USDT_DECIMALS);
-  await approveToken(USDT_ADDRESS, txData.to, totalWei);
 
   // Execute — simulation already passed
   console.log(`[ODOS] Executing bundled swap (${buys.length} tokens in 1 tx)...`);
