@@ -1,19 +1,24 @@
 /**
  * Cron job that evaluates trade decisions for all active agents
- * and executes REAL trades via Odos Router on Arbitrum One.
- * BUYs are bundled into a single transaction for gas efficiency.
+ * and executes REAL 4x leveraged trades via GMX v2 on Arbitrum One.
+ *
+ * BUY  = Open 4x leveraged long position (collateral → GMX)
+ * SELL = Close leveraged position (GMX → collateral + PNL)
+ *
+ * Liquidation: if price drops ~25% from entry, the position is wiped (4x leverage).
  */
 
 import { queryAll, queryOne, execute } from "../db/database.js";
 import { runTradeAgent } from "../agent/agent.js";
 import { fetchMultipleTokens } from "../services/market.js";
 import { fetchTwitterSentiment } from "../services/sentiment.js";
-import { executeBundledBuy, sellTokenForUSDT } from "../services/odos.js";
+import { openLongPosition, closePosition, LEVERAGE } from "../services/gmx.js";
 import { getWallet } from "../services/wallet.js";
 import { getGroqClient, getPoolSize } from "../services/groqPool.js";
 import { fetchCryptoNews } from "../services/news.js";
 import { findRelevantEvents } from "../services/rag.js";
 import { fetchSocialMetrics } from "../services/social.js";
+import { getGmxMarket } from "../services/tokens.js";
 
 // Lock to prevent concurrent evaluations
 let isEvaluating = false;
@@ -45,13 +50,13 @@ async function _evaluateAllAgents() {
     console.warn(`[CRON] Wallet not available: ${err.message} (paper trading still works)`);
   }
 
-  const agents = queryAll("SELECT * FROM agents WHERE is_active = 1");
+  const agents = await queryAll("SELECT * FROM agents WHERE is_active = 1");
   if (!agents.length) {
     console.log("[CRON] No active agents to evaluate");
     return;
   }
 
-  console.log(`[CRON] Evaluating ${agents.length} active agent(s)...`);
+  console.log(`[CRON] Evaluating ${agents.length} active agent(s) [4x LEVERAGED]...`);
 
   // Collect all unique tokens
   const allTokens = new Set();
@@ -82,18 +87,24 @@ async function _evaluateAllAgents() {
 }
 
 async function evaluateAgent(client, agent, allMarketData, sentimentData) {
-  const tokens = JSON.parse(agent.tokens);
-  const holdings = queryAll("SELECT * FROM holdings WHERE agent_id = ?", [agent.id]);
+  const rawTokens = JSON.parse(agent.tokens);
+  // Filter to only tokens that have valid GMX v2 markets
+  const tokens = rawTokens.filter(t => getGmxMarket(t));
+  const positions = await queryAll("SELECT * FROM positions WHERE agent_id = ?", [agent.id]);
 
   const agentMarketData = new Map();
   for (const t of tokens) {
     if (allMarketData.has(t)) agentMarketData.set(t, allMarketData.get(t));
   }
 
-  const currentHoldings = holdings.map((h) => ({
-    token: h.token,
-    amount: h.amount,
-    avgBuyPrice: h.avg_buy_price,
+  // Build current positions info for the AI prompt
+  const currentHoldings = positions.map((p) => ({
+    token: p.token,
+    amount: p.collateral_usd,        // For AI: "amount" is the collateral at risk
+    avgBuyPrice: p.entry_price,
+    collateralUsd: p.collateral_usd,
+    sizeUsd: p.size_usd,
+    leverage: p.leverage,
   }));
 
   const cfg = {
@@ -113,7 +124,7 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     console.warn(`[CRON] News fetch failed for "${agent.name}": ${err.message}`);
   }
   try {
-    ragEvents = findRelevantEvents(tokens, newsData);
+    ragEvents = await findRelevantEvents(tokens, newsData);
   } catch (err) {
     console.warn(`[CRON] RAG lookup failed for "${agent.name}": ${err.message}`);
   }
@@ -123,47 +134,73 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
     console.warn(`[CRON] Social metrics failed for "${agent.name}": ${err.message}`);
   }
 
-  console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)}, news: ${newsData.length}, rag: ${ragEvents.length}, social: ${socialData.length})...`);
+  console.log(`[CRON] Running AI for "${agent.name}" (balance: $${agent.current_balance.toFixed(2)}, positions: ${positions.length}, news: ${newsData.length})...`);
 
   const decision = await runTradeAgent(client, cfg, agentMarketData, sentimentData || [], agent.personality, { newsData, ragEvents, socialData });
 
-  // Momentum-aware forced take-profit (safety net)
-  const tpPctMap = { conservative: 2, balanced: 2, aggressive: 2.5, degen: 2 };
-  const takeProfitPct = tpPctMap[agent.risk_level] || 2;
-  const MIN_PROFIT_USD = 0.10;
-  for (const h of holdings) {
-    const md = agentMarketData.get(h.token);
+  // ═══ Liquidation check ═══
+  // With 4x leverage, liquidation occurs at ~33% price drop from entry
+  for (const p of positions) {
+    const md = agentMarketData.get(p.token);
     if (!md || !md.priceUsd || md.priceUsd <= 0) continue;
-    const pnlPct = ((md.priceUsd - h.avg_buy_price) / h.avg_buy_price) * 100;
-    const profitUsd = (md.priceUsd - h.avg_buy_price) * h.amount;
-    if (pnlPct >= takeProfitPct && profitUsd >= MIN_PROFIT_USD) {
+    const liquidationPrice = p.entry_price * (1 - 1 / p.leverage);
+    if (md.priceUsd <= liquidationPrice) {
+      console.log(`[CRON] LIQUIDATED: "${agent.name}" ${p.token} — price $${md.priceUsd.toFixed(4)} <= liquidation $${liquidationPrice.toFixed(4)}`);
+      // Remove position, collateral is lost
+      await execute("DELETE FROM positions WHERE id = ?", [p.id]);
+      await execute(
+        `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+         VALUES (?, 'SELL', ?, ?, ?, ?, 1.0, ?, 'LIQUIDATED', 'liquidated')`,
+        [agent.id, p.token, 0, md.priceUsd, p.size_usd, `LIQUIDATED: price dropped to $${md.priceUsd.toFixed(4)}, below liquidation at $${liquidationPrice.toFixed(4)}. Collateral of $${p.collateral_usd.toFixed(2)} lost.`]
+      );
+      // Collateral is already deducted from balance when position was opened
+      continue;
+    }
+  }
+
+  // Refresh positions after liquidation check
+  const activePositions = await queryAll("SELECT * FROM positions WHERE agent_id = ?", [agent.id]);
+
+  // ═══ Take-profit: if profit >= $0.25 on OG collateral, take it ═══
+  const MIN_PROFIT_USD = 0.25;
+
+  for (const p of activePositions) {
+    const md = agentMarketData.get(p.token);
+    if (!md || !md.priceUsd || md.priceUsd <= 0) continue;
+
+    // PNL on OG collateral (leverage amplifies price moves)
+    const pricePnlPct = ((md.priceUsd - p.entry_price) / p.entry_price) * 100;
+    const collateralPnlPct = pricePnlPct * p.leverage; // % gain/loss on original collateral
+    const profitUsd = (collateralPnlPct / 100) * p.collateral_usd; // $ profit on OG amount
+
+    if (profitUsd >= MIN_PROFIT_USD) {
       const momentumNegative = (md.priceChange5m || 0) < 0;
-      const hardCap = pnlPct >= 5; // Always sell at 5%+ regardless
-      // Sell if momentum is reversing OR hit hard cap
+      const hardCap = collateralPnlPct >= 5; // Always close at 5%+ gain on collateral
       if (momentumNegative || hardCap) {
-        const alreadySelling = decision.actions?.some(a => a.action === 'SELL' && a.token === h.token);
+        const alreadySelling = decision.actions?.some(a => a.action === 'SELL' && a.token === p.token);
         if (!alreadySelling) {
           if (!decision.actions) decision.actions = [];
+          const leveragedPnlPct = pricePnlPct * p.leverage;
           const reason = hardCap
-            ? `Auto take-profit (hard cap): +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)} profit)`
-            : `Auto take-profit (momentum reversal): +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)} profit, 5m: ${(md.priceChange5m || 0).toFixed(2)}%)`;
+            ? `Auto take-profit (hard cap): price +${pricePnlPct.toFixed(1)}% → ${leveragedPnlPct.toFixed(1)}% on collateral ($${profitUsd.toFixed(2)} profit)`
+            : `Auto take-profit (momentum reversal): price +${pricePnlPct.toFixed(1)}% → ${leveragedPnlPct.toFixed(1)}% on collateral ($${profitUsd.toFixed(2)} profit, 5m: ${(md.priceChange5m || 0).toFixed(2)}%)`;
           decision.actions.push({
             action: 'SELL',
-            token: h.token,
-            amount_usd: h.amount * md.priceUsd,
+            token: p.token,
+            amount_usd: p.collateral_usd + profitUsd, // Full position value
             confidence: 0.95,
             urgency: 'high',
-            reason
+            reason,
           });
           decision.should_trade = true;
-          console.log(`[CRON] ${hardCap ? 'Hard cap' : 'Momentum'} take-profit for "${agent.name}" ${h.token}: +${pnlPct.toFixed(1)}% ($${profitUsd.toFixed(2)}, 5m: ${(md.priceChange5m || 0).toFixed(2)}%)`);
+          console.log(`[CRON] ${hardCap ? 'Hard cap' : 'Momentum'} take-profit for "${agent.name}" ${p.token}: price +${pricePnlPct.toFixed(1)}% → $${profitUsd.toFixed(2)} profit (4x leveraged)`);
         }
       }
     }
   }
 
   // Log the decision
-  execute(
+  await execute(
     `INSERT INTO decisions (agent_id, should_trade, reasoning, market_analysis, raw_json)
      VALUES (?, ?, ?, ?, ?)`,
     [agent.id, decision.should_trade ? 1 : 0, decision.reasoning, decision.market_analysis || "", JSON.stringify(decision)]
@@ -181,190 +218,163 @@ async function evaluateAgent(client, agent, allMarketData, sentimentData) {
   const isPaper = agent.trading_mode === "paper";
 
   if (isPaper) {
-    // Paper trading — simulate trades using market prices
+    // Paper trading — simulate leveraged positions using market prices
     for (const action of sellActions) {
       try {
-        executePaperSell(agent, action, agentMarketData);
+        await executePaperSell(agent, action, agentMarketData);
       } catch (err) {
         console.error(`[CRON] Paper SELL failed for ${agent.name}/${action.token}: ${err.message}`);
-        logFailedTrade(agent.id, action);
+        await logFailedTrade(agent.id, action, err);
       }
     }
     for (const action of buyActions) {
       try {
-        executePaperBuy(agent, action, agentMarketData);
+        await executePaperBuy(agent, action, agentMarketData);
       } catch (err) {
         console.error(`[CRON] Paper BUY failed for ${agent.name}/${action.token}: ${err.message}`);
-        logFailedTrade(agent.id, action);
+        await logFailedTrade(agent.id, action, err);
       }
     }
   } else {
-    // Live trading — execute real trades via Odos
+    // Live trading — execute via GMX v2 perpetual futures
     const wallet = getWallet();
     if (!wallet) {
       console.warn(`[CRON] Wallet not initialized, skipping live trades for "${agent.name}"`);
       return;
     }
 
+    // Execute SELLs (close positions) first
     for (const action of sellActions) {
       try {
-        await executeSell(agent, action, agentMarketData);
+        await executeLiveSell(agent, action, agentMarketData);
       } catch (err) {
         console.error(`[CRON] SELL failed for ${agent.name}/${action.token}: ${err.message}`);
-        logFailedTrade(agent.id, action);
+        await logFailedTrade(agent.id, action, err);
       }
     }
 
-    if (buyActions.length > 0) {
+    // Execute BUYs (open positions) sequentially — GMX doesn't support bundled orders
+    for (const action of buyActions) {
       try {
-        await executeBundledBuys(agent, buyActions, agentMarketData);
+        await executeLiveBuy(agent, action, agentMarketData);
       } catch (err) {
-        console.error(`[CRON] Bundled BUY failed for ${agent.name} after all retries: ${err.message}`);
-        for (const action of buyActions) {
-          logFailedTrade(agent.id, action);
-        }
+        console.error(`[CRON] BUY failed for ${agent.name}/${action.token}: ${err.message}`);
+        await logFailedTrade(agent.id, action, err);
       }
     }
   }
 }
 
-/**
- * Execute all BUY actions in a single Odos transaction
- */
-async function executeBundledBuys(agent, buyActions, marketData) {
-  // Filter valid buys with market data
-  const validBuys = [];
-  for (const action of buyActions) {
-    const md = marketData.get(action.token);
-    if (!md || !md.priceUsd || md.priceUsd <= 0) {
-      console.warn(`[CRON] No market data for ${action.token}, skipping`);
-      continue;
-    }
-    validBuys.push({ ...action, price: md.priceUsd });
-  }
+// ═══ Live Trading: Open 4x Long via GMX v2 ═══
 
-  if (!validBuys.length) return;
-
-  // sanitizeDecision() already enforced budget limits, but do a final safety check
-  const totalRequested = validBuys.reduce((sum, a) => sum + (a.amount_usd || 0), 0);
-  if (totalRequested > agent.current_balance) {
-    const scale = agent.current_balance * 0.95 / totalRequested;
-    for (const a of validBuys) {
-      a.amount_usd = Math.floor(a.amount_usd * scale * 100) / 100;
-    }
-    console.log(`[CRON] Safety scaled BUYs from $${totalRequested.toFixed(2)} to fit $${agent.current_balance.toFixed(2)}`);
-  }
-
-  // Filter out buys below $5 minimum
-  const buys = validBuys.filter((a) => a.amount_usd >= 5);
-  if (!buys.length) {
-    console.warn(`[CRON] All BUY amounts below $5 minimum`);
+async function executeLiveBuy(agent, action, marketData) {
+  const { token, amount_usd, confidence, reason } = action;
+  const md = marketData.get(token);
+  if (!md || !md.priceUsd || md.priceUsd <= 0) {
+    console.warn(`[CRON] No market data for ${token}, skipping BUY`);
     return;
   }
 
-  const totalUsd = buys.reduce((sum, a) => sum + a.amount_usd, 0);
-  console.log(`[CRON] Bundled BUY: $${totalUsd.toFixed(2)} -> ${buys.map((b) => `${b.token}($${b.amount_usd.toFixed(2)})`).join(" + ")}`);
+  const market = getGmxMarket(token);
+  if (!market) {
+    console.warn(`[CRON] No GMX market for ${token}, skipping BUY`);
+    return;
+  }
 
-  // Execute bundled swap: USDT -> multiple tokens in 1 tx
-  const result = await executeBundledBuy(
-    buys.map((b) => ({ symbol: b.token, amountUsd: b.amount_usd })),
-    2 // slippage %
+  let collateralUsd = amount_usd;
+  if (collateralUsd > agent.current_balance) {
+    collateralUsd = agent.current_balance * 0.95;
+  }
+  if (collateralUsd < 5) return;
+
+  const price = md.priceUsd;
+  const sizeUsd = collateralUsd * LEVERAGE;
+
+  console.log(`[CRON] Opening 4x LONG ${token}: $${collateralUsd.toFixed(2)} collateral → $${sizeUsd.toFixed(2)} position via GMX...`);
+
+  const result = await openLongPosition(token, collateralUsd, price);
+
+  // Deduct collateral from agent balance
+  await execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [collateralUsd, agent.id]);
+  agent.current_balance -= collateralUsd;
+
+  // Create or update position
+  const existing = await queryOne("SELECT * FROM positions WHERE agent_id = ? AND token = ?", [agent.id, token]);
+  if (existing) {
+    // Add to existing position (average entry price)
+    const newCollateral = existing.collateral_usd + collateralUsd;
+    const newSize = newCollateral * LEVERAGE;
+    const newEntry = (existing.entry_price * existing.collateral_usd + price * collateralUsd) / newCollateral;
+    await execute(
+      "UPDATE positions SET collateral_usd = ?, size_usd = ?, entry_price = ? WHERE id = ?",
+      [newCollateral, newSize, newEntry, existing.id]
+    );
+  } else {
+    await execute(
+      "INSERT INTO positions (agent_id, token, collateral_usd, size_usd, entry_price, leverage, is_long, gmx_market) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+      [agent.id, token, collateralUsd, sizeUsd, price, LEVERAGE, market.marketAddress]
+    );
+  }
+
+  // Log trade
+  await execute(
+    `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
+     VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
+    [agent.id, token, collateralUsd, price, sizeUsd, confidence, `[4x LONG] ${reason}`, result.txHash]
   );
 
-  // Update DB for each token
-  for (const r of result.results) {
-    const action = buys.find((b) => b.token === r.symbol);
-    if (!action) continue;
-
-    const amountUsd = r.amountUsd;
-    const tokenAmount = r.amountOut;
-    const effectivePrice = tokenAmount > 0 ? amountUsd / tokenAmount : action.price;
-
-    // Update virtual balance
-    execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [amountUsd, agent.id]);
-    agent.current_balance -= amountUsd;
-
-    // Update holdings
-    const existing = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, r.symbol]);
-    if (existing) {
-      const newAmount = existing.amount + tokenAmount;
-      const newAvg = (existing.avg_buy_price * existing.amount + effectivePrice * tokenAmount) / newAmount;
-      execute("UPDATE holdings SET amount = ?, avg_buy_price = ? WHERE id = ?", [newAmount, newAvg, existing.id]);
-    } else {
-      execute("INSERT INTO holdings (agent_id, token, amount, avg_buy_price) VALUES (?, ?, ?, ?)", [agent.id, r.symbol, tokenAmount, effectivePrice]);
-    }
-
-    // Log trade
-    execute(
-      `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
-       VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
-      [agent.id, r.symbol, amountUsd, effectivePrice, tokenAmount, action.confidence, action.reason, result.txHash]
-    );
-
-    console.log(`[CRON] BUY ${r.symbol}: $${amountUsd.toFixed(2)} -> ${tokenAmount.toFixed(6)} tokens (tx: ${result.txHash})`);
-  }
+  console.log(`[CRON] BUY ${token}: $${collateralUsd.toFixed(2)} collateral × 4x = $${sizeUsd.toFixed(2)} position (tx: ${result.txHash})`);
 }
 
-/**
- * Execute a single SELL via Odos
- */
-async function executeSell(agent, action, marketData) {
-  const { token, amount_usd, confidence, reason } = action;
+// ═══ Live Trading: Close Position via GMX v2 ═══
+
+async function executeLiveSell(agent, action, marketData) {
+  const { token, confidence, reason } = action;
   const md = marketData.get(token);
   if (!md || !md.priceUsd || md.priceUsd <= 0) {
     console.warn(`[CRON] No market data for ${token}, skipping SELL`);
     return;
   }
 
+  const position = await queryOne("SELECT * FROM positions WHERE agent_id = ? AND token = ?", [agent.id, token]);
+  if (!position) {
+    console.warn(`[CRON] No position to close for ${token}`);
+    return;
+  }
+
   const price = md.priceUsd;
-  const holding = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, token]);
-  if (!holding || holding.amount <= 0) {
-    console.warn(`[CRON] No holdings to sell for ${token}`);
-    return;
-  }
+  const pricePnlPct = ((price - position.entry_price) / position.entry_price) * 100;
+  const profitUsd = (pricePnlPct / 100) * position.size_usd;
+  const receivedUsd = Math.max(0, position.collateral_usd + profitUsd); // Can't receive less than 0
 
-  const maxSellUsd = holding.amount * price;
-  const sellUsd = Math.min(amount_usd, maxSellUsd);
-  const sellTokens = sellUsd / price;
+  console.log(`[CRON] Closing 4x LONG ${token}: $${position.size_usd.toFixed(2)} position, PNL: $${profitUsd >= 0 ? '+' : ''}${profitUsd.toFixed(2)} via GMX...`);
 
-  if (sellTokens < 0.000001) {
-    console.warn(`[CRON] Amount too small for SELL ${token}`);
-    return;
-  }
+  const result = await closePosition(token, position.size_usd, price);
 
-  console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} tokens via Odos...`);
+  // Use the actual received amount from GMX, or our estimate if GMX returns 0
+  const actualReceived = result.receivedUsd > 0 ? result.receivedUsd : receivedUsd;
 
-  const result = await sellTokenForUSDT(token, sellTokens, 2);
+  // Credit received USDT to agent balance
+  await execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualReceived, agent.id]);
+  agent.current_balance += actualReceived;
 
-  const actualUsdtReceived = result.amountOut;
-  const effectivePrice = sellTokens > 0 ? actualUsdtReceived / sellTokens : price;
-  const remainingTokens = holding.amount - sellTokens;
-
-  // Update virtual balance
-  execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualUsdtReceived, agent.id]);
-  agent.current_balance += actualUsdtReceived;
-
-  // Update holdings
-  if (remainingTokens <= 0.000001) {
-    execute("DELETE FROM holdings WHERE id = ?", [holding.id]);
-  } else {
-    execute("UPDATE holdings SET amount = ? WHERE id = ?", [remainingTokens, holding.id]);
-  }
+  // Remove position
+  await execute("DELETE FROM positions WHERE id = ?", [position.id]);
 
   // Log trade
-  execute(
+  const leveragedPnlPct = pricePnlPct * position.leverage;
+  await execute(
     `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
      VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, ?, 'completed')`,
-    [agent.id, token, actualUsdtReceived, effectivePrice, sellTokens, confidence, reason, result.txHash]
+    [agent.id, token, actualReceived, price, position.size_usd, confidence, `[CLOSE 4x LONG] PNL: ${leveragedPnlPct >= 0 ? '+' : ''}${leveragedPnlPct.toFixed(1)}% ($${profitUsd >= 0 ? '+' : ''}${profitUsd.toFixed(2)}). ${reason}`, result.txHash]
   );
 
-  console.log(`[CRON] SELL ${token}: ${sellTokens.toFixed(6)} -> $${actualUsdtReceived.toFixed(2)} (tx: ${result.txHash})`);
+  console.log(`[CRON] SELL ${token}: closed $${position.size_usd.toFixed(2)} position → received $${actualReceived.toFixed(2)} (PNL: $${profitUsd >= 0 ? '+' : ''}${profitUsd.toFixed(2)}, tx: ${result.txHash})`);
 }
 
-/**
- * Paper trading: simulate a BUY using current market price
- */
-function executePaperBuy(agent, action, marketData) {
+// ═══ Paper Trading: Simulate 4x Leveraged Positions ═══
+
+async function executePaperBuy(agent, action, marketData) {
   const md = marketData.get(action.token);
   if (!md || !md.priceUsd || md.priceUsd <= 0) {
     console.warn(`[CRON] No market data for ${action.token}, skipping paper BUY`);
@@ -372,43 +382,48 @@ function executePaperBuy(agent, action, marketData) {
   }
 
   const price = md.priceUsd;
-  let amountUsd = action.amount_usd;
+  let collateralUsd = action.amount_usd;
 
-  if (amountUsd > agent.current_balance) {
-    amountUsd = agent.current_balance * 0.95;
+  if (collateralUsd > agent.current_balance) {
+    collateralUsd = agent.current_balance * 0.95;
   }
-  if (amountUsd < 5) return;
+  if (collateralUsd < 5) return;
 
-  const tokenAmount = amountUsd / price;
+  const sizeUsd = collateralUsd * LEVERAGE;
 
-  // Update virtual balance
-  execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [amountUsd, agent.id]);
-  agent.current_balance -= amountUsd;
+  // Deduct collateral from balance
+  await execute("UPDATE agents SET current_balance = current_balance - ? WHERE id = ?", [collateralUsd, agent.id]);
+  agent.current_balance -= collateralUsd;
 
-  // Update holdings
-  const existing = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
+  // Create or update position
+  const existing = await queryOne("SELECT * FROM positions WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
   if (existing) {
-    const newAmount = existing.amount + tokenAmount;
-    const newAvg = (existing.avg_buy_price * existing.amount + price * tokenAmount) / newAmount;
-    execute("UPDATE holdings SET amount = ?, avg_buy_price = ? WHERE id = ?", [newAmount, newAvg, existing.id]);
+    const newCollateral = existing.collateral_usd + collateralUsd;
+    const newSize = newCollateral * LEVERAGE;
+    const newEntry = (existing.entry_price * existing.collateral_usd + price * collateralUsd) / newCollateral;
+    await execute(
+      "UPDATE positions SET collateral_usd = ?, size_usd = ?, entry_price = ? WHERE id = ?",
+      [newCollateral, newSize, newEntry, existing.id]
+    );
   } else {
-    execute("INSERT INTO holdings (agent_id, token, amount, avg_buy_price) VALUES (?, ?, ?, ?)", [agent.id, action.token, tokenAmount, price]);
+    const market = getGmxMarket(action.token);
+    await execute(
+      "INSERT INTO positions (agent_id, token, collateral_usd, size_usd, entry_price, leverage, is_long, gmx_market) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+      [agent.id, action.token, collateralUsd, sizeUsd, price, LEVERAGE, market?.marketAddress || '']
+    );
   }
 
   // Log trade
-  execute(
+  await execute(
     `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
      VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, 'PAPER', 'paper')`,
-    [agent.id, action.token, amountUsd, price, tokenAmount, action.confidence, action.reason]
+    [agent.id, action.token, collateralUsd, price, sizeUsd, action.confidence, `[PAPER 4x LONG] ${action.reason}`]
   );
 
-  console.log(`[CRON] PAPER BUY ${action.token}: $${amountUsd.toFixed(2)} -> ${tokenAmount.toFixed(6)} tokens @ $${price}`);
+  console.log(`[CRON] PAPER BUY ${action.token}: $${collateralUsd.toFixed(2)} collateral × 4x = $${sizeUsd.toFixed(2)} position @ $${price}`);
 }
 
-/**
- * Paper trading: simulate a SELL using current market price
- */
-function executePaperSell(agent, action, marketData) {
+async function executePaperSell(agent, action, marketData) {
   const md = marketData.get(action.token);
   if (!md || !md.priceUsd || md.priceUsd <= 0) {
     console.warn(`[CRON] No market data for ${action.token}, skipping paper SELL`);
@@ -416,46 +431,40 @@ function executePaperSell(agent, action, marketData) {
   }
 
   const price = md.priceUsd;
-  const holding = queryOne("SELECT * FROM holdings WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
-  if (!holding || holding.amount <= 0) {
-    console.warn(`[CRON] No holdings to sell for ${action.token}`);
+  const position = await queryOne("SELECT * FROM positions WHERE agent_id = ? AND token = ?", [agent.id, action.token]);
+  if (!position) {
+    console.warn(`[CRON] No position to close for ${action.token}`);
     return;
   }
 
-  const maxSellUsd = holding.amount * price;
-  const sellUsd = Math.min(action.amount_usd, maxSellUsd);
-  const sellTokens = sellUsd / price;
+  // Calculate leveraged PNL
+  const pricePnlPct = ((price - position.entry_price) / position.entry_price) * 100;
+  const profitUsd = (pricePnlPct / 100) * position.size_usd;
+  const receivedUsd = Math.max(0, position.collateral_usd + profitUsd);
 
-  if (sellTokens < 0.000001) return;
+  // Credit to balance
+  await execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [receivedUsd, agent.id]);
+  agent.current_balance += receivedUsd;
 
-  const actualUsdtReceived = sellTokens * price;
-  const remainingTokens = holding.amount - sellTokens;
-
-  // Update virtual balance
-  execute("UPDATE agents SET current_balance = current_balance + ? WHERE id = ?", [actualUsdtReceived, agent.id]);
-  agent.current_balance += actualUsdtReceived;
-
-  // Update holdings
-  if (remainingTokens <= 0.000001) {
-    execute("DELETE FROM holdings WHERE id = ?", [holding.id]);
-  } else {
-    execute("UPDATE holdings SET amount = ? WHERE id = ?", [remainingTokens, holding.id]);
-  }
+  // Remove position
+  await execute("DELETE FROM positions WHERE id = ?", [position.id]);
 
   // Log trade
-  execute(
+  const leveragedPnlPct = pricePnlPct * position.leverage;
+  await execute(
     `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, tx_hash, status)
      VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, 'PAPER', 'paper')`,
-    [agent.id, action.token, actualUsdtReceived, price, sellTokens, action.confidence, action.reason]
+    [agent.id, action.token, receivedUsd, price, position.size_usd, action.confidence, `[PAPER CLOSE 4x] PNL: ${leveragedPnlPct >= 0 ? '+' : ''}${leveragedPnlPct.toFixed(1)}% ($${profitUsd >= 0 ? '+' : ''}${profitUsd.toFixed(2)}). ${action.reason}`]
   );
 
-  console.log(`[CRON] PAPER SELL ${action.token}: ${sellTokens.toFixed(6)} -> $${actualUsdtReceived.toFixed(2)} @ $${price}`);
+  console.log(`[CRON] PAPER SELL ${action.token}: closed $${position.size_usd.toFixed(2)} position → $${receivedUsd.toFixed(2)} (PNL: $${profitUsd >= 0 ? '+' : ''}${profitUsd.toFixed(2)})`);
 }
 
-function logFailedTrade(agentId, action) {
-  execute(
+async function logFailedTrade(agentId, action, error = null) {
+  const errMsg = error ? ` | ERROR: ${error.message || error}` : "";
+  await execute(
     `INSERT INTO trades (agent_id, action, token, amount_usd, price, token_amount, confidence, reasoning, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed')`,
-    [agentId, action.action, action.token, action.amount_usd || 0, 0, 0, action.confidence, `FAILED: ${action.reason || ""}`]
+    [agentId, action.action, action.token, action.amount_usd || 0, 0, 0, action.confidence, `FAILED: ${action.reason || ""}${errMsg}`]
   );
 }
