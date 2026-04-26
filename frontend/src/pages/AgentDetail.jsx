@@ -207,29 +207,33 @@ export default function AgentDetail() {
           <div className="space-y-2">
             {agent.holdings.map((h) => {
               const tokenPnl = h.pnl_percent ?? 0;
+              const profitUsd = h.profit_usd ?? 0;
               return (
                 <div
                   key={h.token}
                   className="flex items-center justify-between py-2 border-b border-dark-700 last:border-0"
                 >
                   <div>
-                    <div className="font-mono font-medium text-white">{h.token}</div>
-                    {h.value > 0 && (
-                      <div className={`text-xs font-mono ${tokenPnl >= 0 ? "text-accent-green" : "text-accent-red"}`}>
-                        {tokenPnl >= 0 ? "+" : ""}{tokenPnl.toFixed(1)}%
-                      </div>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-medium text-white">{h.token}</span>
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green font-bold">
+                        {h.leverage ?? 4}x LONG
+                      </span>
+                    </div>
+                    <div className={`text-xs font-mono ${tokenPnl >= 0 ? "text-accent-green" : "text-accent-red"}`}>
+                      {tokenPnl >= 0 ? "+" : ""}{tokenPnl.toFixed(1)}% ({profitUsd >= 0 ? "+" : ""}${profitUsd.toFixed(2)})
+                    </div>
                   </div>
                   <div className="text-right text-sm">
                     <div className="text-gray-300 font-mono">
-                      {h.amount.toLocaleString(undefined, { maximumFractionDigits: 4 })} tokens
+                      ${(h.collateral_usd ?? 0).toFixed(2)} collateral → ${(h.size_usd ?? 0).toFixed(2)} size
                     </div>
                     <div className="text-gray-500">
-                      avg ${h.avg_buy_price}{h.current_price > 0 ? ` → $${h.current_price}` : ""}
+                      entry ${(h.entry_price ?? 0).toFixed(4)}{h.current_price > 0 ? ` → $${h.current_price.toFixed(4)}` : ""}
                     </div>
                     {h.value > 0 && (
                       <div className="text-gray-400 font-mono text-xs">
-                        ≈ ${h.value.toFixed(2)}
+                        value ≈ ${h.value.toFixed(2)}
                       </div>
                     )}
                   </div>
